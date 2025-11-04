@@ -4,7 +4,6 @@
 ChannelAlign — Tkinter GUI (no PySimpleGUI) for multi‑channel TIFF registration (translation-only)
 and export of aligned multi‑channel TIFFs, with an alignment CSV log.
 
-Author: ChatGPT (GPT-5 Pro)
 License: MIT
 
 Dependencies (pip):
@@ -41,6 +40,7 @@ import csv
 import math
 import queue
 import threading
+import argparse
 import datetime as _dt
 from typing import List, Tuple, Optional
 
@@ -48,6 +48,15 @@ import numpy as np
 from tifffile import imread, imwrite
 from skimage.registration import phase_cross_correlation
 from scipy import ndimage
+
+try:
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # type: ignore
+    _HAVE_MPL = True
+except Exception:  # pragma: no cover - optional dependency
+    plt = None
+    _HAVE_MPL = False
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -173,6 +182,53 @@ def stack_and_save_tiff(
     if channel_names:
         metadata['Channel'] = list(channel_names)
     imwrite(out_path, stacked, metadata=metadata)
+
+
+def sanitize_filename_component(text: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in text)
+    cleaned = cleaned.strip("_")
+    return cleaned or "sample"
+
+
+def _normalize_for_display(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=float)
+    if arr.size == 0:
+        return np.zeros_like(arr, dtype=float)
+    lo, hi = np.percentile(arr, (1, 99))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(arr.min()), float(arr.max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.zeros_like(arr, dtype=float)
+    norm = (arr - lo) / (hi - lo)
+    return np.clip(norm, 0.0, 1.0)
+
+
+def _make_dual_overlay(ref_image: np.ndarray, target_image: np.ndarray) -> np.ndarray:
+    ref_norm = _normalize_for_display(ref_image)
+    target_norm = _normalize_for_display(target_image)
+    zeros = np.zeros_like(ref_norm)
+    return np.stack([target_norm, zeros, ref_norm], axis=-1)
+
+
+def generate_pair_overlay(
+    qc_path: str,
+    ref_fixed: np.ndarray,
+    target_before: np.ndarray,
+    target_after: np.ndarray
+) -> None:
+    if not _HAVE_MPL or plt is None:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
+    try:
+        axes[0].imshow(_make_dual_overlay(ref_fixed, target_before))
+        axes[0].set_title("Before alignment")
+        axes[1].imshow(_make_dual_overlay(ref_fixed, target_after))
+        axes[1].set_title("After alignment")
+        for ax in axes:
+            ax.axis("off")
+        fig.savefig(qc_path, dpi=150)
+    finally:
+        plt.close(fig)
 
 
 def stem(path: str) -> str:
@@ -307,6 +363,127 @@ def align_multichannel_array(
         aligned = [im[y0:y1, x0:x1] for im in aligned]
     out = np.stack(aligned, axis=0)  # (C, Hc, Wc)
     return out, shifts, (y0, y1, x0, x1)
+
+
+def align_channel1_between_dirs(
+    fixed_dir: str,
+    moving_dir: str,
+    out_dir: str,
+    pattern: str = "*.tif",
+    ref_index: int = 0,
+    target_index: int = 1,
+    upsample_factor: int = 10,
+    interpolation_order: int = 1,
+    crop_to_overlap: bool = True,
+    log_print = print
+) -> None:
+    """Align channel `target_index` images between two folders using channel `ref_index` as reference."""
+    if not os.path.isdir(fixed_dir):
+        raise FileNotFoundError(f"Fixed directory not found: {fixed_dir}")
+    if not os.path.isdir(moving_dir):
+        raise FileNotFoundError(f"Moving directory not found: {moving_dir}")
+
+    fixed_files = list_tiff_files(fixed_dir, pattern)
+    moving_files = list_tiff_files(moving_dir, pattern)
+    if not fixed_files:
+        raise FileNotFoundError(f"No TIFF files matching '{pattern}' found in {fixed_dir}")
+    if not moving_files:
+        raise FileNotFoundError(f"No TIFF files matching '{pattern}' found in {moving_dir}")
+
+    total = min(len(fixed_files), len(moving_files))
+    if total == 0:
+        raise RuntimeError("No paired files available for alignment.")
+    if len(fixed_files) != len(moving_files):
+        log_print(f"⚠️  File counts differ ({len(fixed_files)} vs {len(moving_files)}); aligning first {total} pairs.")
+
+    os.makedirs(out_dir, exist_ok=True)
+    qc_dir = os.path.join(out_dir, "qc")
+    os.makedirs(qc_dir, exist_ok=True)
+
+    log_path = os.path.join(out_dir, "alignment_channel1_log.csv")
+    with open(log_path, 'w', newline='') as f_log:
+        writer = csv.writer(f_log)
+        writer.writerow([
+            "timestamp", "pair_index", "sample_id",
+            "fixed_file", "moving_file",
+            "ref_index", "target_index",
+            "dy_px", "dx_px", "distance_px",
+            "upsample_factor", "interp_order",
+            "roi_height", "roi_width", "reg_error"
+        ])
+
+        for idx in range(total):
+            fixed_file = fixed_files[idx]
+            moving_file = moving_files[idx]
+            log_print(f"[{idx+1}/{total}] Aligning channel {target_index} using reference channel {ref_index}:")
+            log_print(f"    Fixed : {fixed_file}")
+            log_print(f"    Moving: {moving_file}")
+
+            arr_fixed = imread(fixed_file)
+            arr_moving = imread(moving_file)
+
+            ax_fixed = detect_channel_axis(arr_fixed)
+            ax_moving = detect_channel_axis(arr_moving)
+            arr_fixed = np.moveaxis(arr_fixed, ax_fixed, 0)
+            arr_moving = np.moveaxis(arr_moving, ax_moving, 0)
+
+            C_fixed, Hf, Wf = arr_fixed.shape
+            C_moving, Hm, Wm = arr_moving.shape
+            if ref_index >= C_fixed or ref_index >= C_moving:
+                raise ValueError(f"Reference channel index {ref_index} missing (sizes {C_fixed}, {C_moving}).")
+            if target_index >= C_fixed or target_index >= C_moving:
+                raise ValueError(f"Target channel index {target_index} missing (sizes {C_fixed}, {C_moving}).")
+
+            H = min(Hf, Hm)
+            W = min(Wf, Wm)
+            fixed_center = [center_crop_to(arr_fixed[c], (H, W)) for c in range(C_fixed)]
+            moving_center = [center_crop_to(arr_moving[c], (H, W)) for c in range(C_moving)]
+
+            ref_fixed = fixed_center[ref_index]
+            ref_moving = moving_center[ref_index]
+            shift, error, diffphase = phase_cross_correlation(ref_fixed, ref_moving, upsample_factor=upsample_factor)
+            dy, dx = float(shift[0]), float(shift[1])
+            dist = math.hypot(dy, dx)
+            log_print(f"    ↳ shift dy={dy:.4f}, dx={dx:.4f} (|Δ|={dist:.4f} px)")
+
+            moved_ref = ndimage.shift(ref_moving, shift=(dy, dx), order=interpolation_order, mode='constant', cval=0.0)
+            moved_target = ndimage.shift(moving_center[target_index], shift=(dy, dx), order=interpolation_order, mode='constant', cval=0.0)
+
+            y0, y1, x0, x1 = (0, H, 0, W)
+            if crop_to_overlap:
+                y0, y1, x0, x1 = compute_overlap_bounds(H, W, [(0.0, 0.0), (dy, dx)])
+
+            ref_fixed_c = ref_fixed[y0:y1, x0:x1]
+            target_fixed_c = fixed_center[target_index][y0:y1, x0:x1]
+            before_target_c = moving_center[target_index][y0:y1, x0:x1]
+            moved_target_c = moved_target[y0:y1, x0:x1]
+
+            sample_id_raw = os.path.basename(os.path.commonprefix([stem(fixed_file), stem(moving_file)])).strip("_-. ")
+            sample_id = sanitize_filename_component(sample_id_raw or stem(fixed_file) or stem(moving_file) or f"pair_{idx+1}")
+            pair_stack = [target_fixed_c, moved_target_c]
+            channel_names = [
+                f"{stem(fixed_file)}_ch{target_index}_fixed",
+                f"{stem(moving_file)}_ch{target_index}_aligned"
+            ]
+            out_path = os.path.join(out_dir, f"{sample_id}_ch{target_index}_pair.tif")
+            stack_and_save_tiff(out_path, pair_stack, channel_names=channel_names)
+            log_print(f"    ✅ Saved aligned pair: {out_path}")
+
+            qc_path = os.path.join(qc_dir, f"{sample_id}_qc.png")
+            generate_pair_overlay(qc_path, ref_fixed_c, before_target_c, moved_target_c)
+
+            writer.writerow([
+                _timestamp(), idx + 1, sample_id,
+                os.path.basename(fixed_file), os.path.basename(moving_file),
+                ref_index, target_index,
+                dy, dx, dist,
+                upsample_factor, interpolation_order,
+                y1 - y0, x1 - x0, error
+            ])
+            f_log.flush()
+
+    log_print(f"📄 Channel 1 alignment log written to: {log_path}")
+    log_print(f"🖼️ QC overlays in: {qc_dir}")
 
 
 # ------------------------------- Tkinter GUI -------------------------------
@@ -816,14 +993,64 @@ class ChannelAlignApp(tk.Tk):
         self.destroy()
 
 
-def main():
+def parse_cli_args(argv: Optional[List[str]] = None):
+    parser = argparse.ArgumentParser(
+        description="ChannelAlign Tk GUI and command-line helpers",
+        add_help=True
+    )
+    parser.add_argument(
+        "--align-channel1",
+        action="store_true",
+        help="Align channel `target-index` between two folders using channel `ref-index` as the reference."
+    )
+    parser.add_argument("--fixed-dir", default="4", help="Fixed/reference folder (default: ./4).")
+    parser.add_argument("--moving-dir", default="4-2", help="Moving folder to align (default: ./4-2).")
+    parser.add_argument("--output-dir", default="aligned_channel1", help="Output directory for aligned channel 1 results.")
+    parser.add_argument("--pattern", default="*.tif", help="Glob pattern to match TIFF files (default: *.tif).")
+    parser.add_argument("--ref-index", type=int, default=0, help="Reference channel index (default: 0).")
+    parser.add_argument("--target-index", type=int, default=1, help="Target channel index to align (default: 1).")
+    parser.add_argument("--upsample", type=int, default=10, help="Upsample factor for phase cross-correlation (default: 10).")
+    parser.add_argument("--interp-order", type=int, default=1, help="Interpolation order for ndimage.shift (default: 1).")
+    parser.add_argument("--no-crop", action="store_true", help="Disable cropping to the common overlap after alignment.")
+    parser.add_argument("--with-gui", action="store_true", help="Launch the GUI after completing command-line tasks.")
+    parser.add_argument("--no-gui", action="store_true", help="Skip launching the GUI entirely.")
+    return parser.parse_known_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    args, unknown = parse_cli_args(argv)
+    ran_cli_task = False
+
+    if args.align_channel1:
+        align_channel1_between_dirs(
+            fixed_dir=args.fixed_dir,
+            moving_dir=args.moving_dir,
+            out_dir=args.output_dir,
+            pattern=args.pattern,
+            ref_index=args.ref_index,
+            target_index=args.target_index,
+            upsample_factor=args.upsample,
+            interpolation_order=args.interp_order,
+            crop_to_overlap=not args.no_crop,
+            log_print=print
+        )
+        ran_cli_task = True
+
+    launch_gui = not args.no_gui
+    if ran_cli_task and not args.with_gui:
+        launch_gui = False
+
+    if not launch_gui:
+        return
+
+    sys.argv = [sys.argv[0]] + unknown
     app = ChannelAlignApp()
     app.mainloop()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)
