@@ -42,7 +42,7 @@ import queue
 import threading
 import argparse
 import datetime as _dt
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 
 import numpy as np
 from tifffile import imread, imwrite
@@ -231,6 +231,122 @@ def generate_pair_overlay(
         plt.close(fig)
 
 
+def generate_dual_channel_qc(
+    qc_path: str,
+    fixed_ch0: np.ndarray,
+    moving_ch0: np.ndarray,
+    aligned_ch0: np.ndarray,
+    fixed_ch1: np.ndarray,
+    moving_ch1: np.ndarray,
+    aligned_ch1: np.ndarray,
+    dy: float,
+    dx: float,
+    error: float,
+    fixed_label: str = "Fixed",
+    moving_label: str = "Moving"
+) -> None:
+    """
+    Generate a comprehensive QC overlay showing both channel 0 and channel 1 alignments.
+    
+    CONSISTENT LABELING:
+        Channel 0 (Ch0) = Nuclei (DAPI) - shown in Row 0
+        Channel 1 (Ch1) = Protein marker - shown in Row 1
+    """
+    if not _HAVE_MPL or plt is None:
+        return
+    
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9), constrained_layout=True)
+    try:
+        # Row 0: Channel 0 (Nuclei)
+        axes[0, 0].imshow(_normalize_for_display(fixed_ch0), cmap="gray")
+        axes[0, 0].set_title(f"{fixed_label}\nChannel 0 (Nuclei)", fontsize=10)
+        axes[0, 0].axis("off")
+        
+        axes[0, 1].imshow(_normalize_for_display(aligned_ch0), cmap="gray")
+        axes[0, 1].set_title(f"{moving_label} (aligned)\nChannel 0 (Nuclei)", fontsize=10)
+        axes[0, 1].axis("off")
+        
+        overlay_ch0 = _make_dual_overlay(fixed_ch0, aligned_ch0)
+        axes[0, 2].imshow(overlay_ch0)
+        axes[0, 2].set_title(f"Ch0 Overlay (Nuclei)\nRed=Aligned, Blue=Fixed", fontsize=10)
+        axes[0, 2].axis("off")
+        
+        # Row 1: Channel 1 (Protein)
+        axes[1, 0].imshow(_normalize_for_display(fixed_ch1), cmap="gray")
+        axes[1, 0].set_title(f"{fixed_label}\nChannel 1 (Protein)", fontsize=10)
+        axes[1, 0].axis("off")
+        
+        axes[1, 1].imshow(_normalize_for_display(aligned_ch1), cmap="gray")
+        axes[1, 1].set_title(f"{moving_label} (aligned)\nChannel 1 (Protein)", fontsize=10)
+        axes[1, 1].axis("off")
+        
+        overlay_ch1 = _make_dual_overlay(fixed_ch1, aligned_ch1)
+        axes[1, 2].imshow(overlay_ch1)
+        axes[1, 2].set_title(f"Ch1 Overlay (Protein)\nRed=Aligned, Blue=Fixed", fontsize=10)
+        axes[1, 2].axis("off")
+        
+        fig.suptitle(f"Alignment QC: shift dy={dy:.3f}, dx={dx:.3f} (error={error:.4f})", fontsize=12, fontweight='bold')
+        fig.savefig(qc_path, dpi=150, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+
+def generate_raw_comparison_qc(
+    qc_path: str,
+    fixed_ch0: np.ndarray,
+    moving_ch0: np.ndarray,
+    fixed_ch1: np.ndarray,
+    moving_ch1: np.ndarray,
+    fixed_label: str = "Fixed",
+    moving_label: str = "Moving"
+) -> None:
+    """
+    Generate a 2x3 grid showing raw (unaligned) images for both channels.
+    Useful for initial diagnostics before alignment.
+    
+    CONSISTENT LABELING:
+        Row 0: Channel 0 (Nuclei) - Fixed | Moving | Overlay (no alignment)
+        Row 1: Channel 1 (Protein) - Fixed | Moving | Overlay (no alignment)
+    """
+    if not _HAVE_MPL or plt is None:
+        return
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10), constrained_layout=True)
+    try:
+        # Row 0: Channel 0 (Nuclei)
+        axes[0, 0].imshow(_normalize_for_display(fixed_ch0), cmap='gray')
+        axes[0, 0].set_title(f'{fixed_label}\nChannel 0 (Nuclei)', fontsize=10)
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(_normalize_for_display(moving_ch0), cmap='gray')
+        axes[0, 1].set_title(f'{moving_label}\nChannel 0 (Nuclei)', fontsize=10)
+        axes[0, 1].axis('off')
+        
+        overlay_ch0 = _make_dual_overlay(fixed_ch0, moving_ch0)
+        axes[0, 2].imshow(overlay_ch0)
+        axes[0, 2].set_title('Ch0 Overlay (Nuclei - No alignment)\nRed=Moving, Blue=Fixed', fontsize=10)
+        axes[0, 2].axis('off')
+        
+        # Row 1: Channel 1 (Protein)
+        axes[1, 0].imshow(_normalize_for_display(fixed_ch1), cmap='gray')
+        axes[1, 0].set_title(f'{fixed_label}\nChannel 1 (Protein)', fontsize=10)
+        axes[1, 0].axis('off')
+        
+        axes[1, 1].imshow(_normalize_for_display(moving_ch1), cmap='gray')
+        axes[1, 1].set_title(f'{moving_label}\nChannel 1 (Protein)', fontsize=10)
+        axes[1, 1].axis('off')
+        
+        overlay_ch1 = _make_dual_overlay(fixed_ch1, moving_ch1)
+        axes[1, 2].imshow(overlay_ch1)
+        axes[1, 2].set_title('Ch1 Overlay (Protein - No alignment)\nRed=Moving, Blue=Fixed', fontsize=10)
+        axes[1, 2].axis('off')
+        
+        fig.suptitle('Raw Images - Before Alignment', fontsize=14, fontweight='bold')
+        fig.savefig(qc_path, dpi=150, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+
 def stem(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
@@ -375,7 +491,8 @@ def align_channel1_between_dirs(
     upsample_factor: int = 10,
     interpolation_order: int = 1,
     crop_to_overlap: bool = True,
-    log_print = print
+    log_print = print,
+    progress_cb: Optional[Callable[[int, int], None]] = None
 ) -> None:
     """Align channel `target_index` images between two folders using channel `ref_index` as reference."""
     if not os.path.isdir(fixed_dir):
@@ -457,6 +574,7 @@ def align_channel1_between_dirs(
             target_fixed_c = fixed_center[target_index][y0:y1, x0:x1]
             before_target_c = moving_center[target_index][y0:y1, x0:x1]
             moved_target_c = moved_target[y0:y1, x0:x1]
+            moved_ref_c = moved_ref[y0:y1, x0:x1]
 
             sample_id_raw = os.path.basename(os.path.commonprefix([stem(fixed_file), stem(moving_file)])).strip("_-. ")
             sample_id = sanitize_filename_component(sample_id_raw or stem(fixed_file) or stem(moving_file) or f"pair_{idx+1}")
@@ -469,8 +587,34 @@ def align_channel1_between_dirs(
             stack_and_save_tiff(out_path, pair_stack, channel_names=channel_names)
             log_print(f"    ✅ Saved aligned pair: {out_path}")
 
+            # Generate raw comparison QC (before alignment)
+            raw_qc_path = os.path.join(qc_dir, f"{sample_id}_raw_comparison.png")
+            generate_raw_comparison_qc(
+                raw_qc_path,
+                fixed_ch0=ref_fixed_c,
+                moving_ch0=moving_center[ref_index][y0:y1, x0:x1],
+                fixed_ch1=target_fixed_c,
+                moving_ch1=before_target_c,
+                fixed_label=stem(fixed_file),
+                moving_label=stem(moving_file)
+            )
+
+            # Generate comprehensive QC for both channels (after alignment)
             qc_path = os.path.join(qc_dir, f"{sample_id}_qc.png")
-            generate_pair_overlay(qc_path, ref_fixed_c, before_target_c, moved_target_c)
+            generate_dual_channel_qc(
+                qc_path,
+                fixed_ch0=ref_fixed_c,
+                moving_ch0=moving_center[ref_index][y0:y1, x0:x1],
+                aligned_ch0=moved_ref_c,
+                fixed_ch1=target_fixed_c,
+                moving_ch1=before_target_c,
+                aligned_ch1=moved_target_c,
+                dy=dy,
+                dx=dx,
+                error=error,
+                fixed_label=stem(fixed_file),
+                moving_label=stem(moving_file)
+            )
 
             writer.writerow([
                 _timestamp(), idx + 1, sample_id,
@@ -481,6 +625,8 @@ def align_channel1_between_dirs(
                 y1 - y0, x1 - x0, error
             ])
             f_log.flush()
+            if progress_cb is not None:
+                progress_cb(idx + 1, total)
 
     log_print(f"📄 Channel 1 alignment log written to: {log_path}")
     log_print(f"🖼️ QC overlays in: {qc_dir}")
@@ -529,18 +675,22 @@ class ChannelAlignApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.tab_batch = ttk.Frame(self.notebook)
         self.tab_mc = ttk.Frame(self.notebook)
+        self.tab_pair = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_batch, text="Per‑channel folders (Batch)")
         self.notebook.add(self.tab_mc, text="Multi‑channel TIFF(s)")
+        self.notebook.add(self.tab_pair, text="Dataset pair (Channel 0→1)")
         self.notebook.pack(fill="both", expand=True)
 
         # Threading helpers
         self._batch_thread: Optional[threading.Thread] = None
         self._mc_thread: Optional[threading.Thread] = None
+        self._pair_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
         # Build tabs
         self._build_batch_tab()
         self._build_mc_tab()
+        self._build_pair_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -695,10 +845,14 @@ class ChannelAlignApp(tk.Tk):
     def _post_log_mc(self, msg: str):
         self.after(0, lambda: self._append_log(self.mc_log, msg))
 
+    def _post_log_pair(self, msg: str):
+        self.after(0, lambda: self._append_log(self.pair_log, msg))
+
     def _on_stop(self):
         self._stop_event.set()
         self._post_log_batch("⛔ Stop requested; will finish current item then stop.")
         self._post_log_mc("⛔ Stop requested; will finish current item then stop.")
+        self._post_log_pair("⛔ Stop requested; will finish current item then stop.")
 
     def _toggle_run_buttons(self, busy: bool, which: str):
         if which == "batch":
@@ -707,6 +861,9 @@ class ChannelAlignApp(tk.Tk):
         elif which == "mc":
             self.btn_runmc.configure(state="disabled" if busy else "normal")
             self.btn_stop_mc.configure(state="normal" if busy else "disabled")
+        elif which == "pair":
+            self.btn_runpair.configure(state="disabled" if busy else "normal")
+            self.btn_stop_pair.configure(state="normal" if busy else "disabled")
 
     def _on_run_batch(self):
         if self._batch_thread and self._batch_thread.is_alive():
@@ -882,6 +1039,70 @@ class ChannelAlignApp(tk.Tk):
         f.grid_rowconfigure(9, weight=1)
         f.grid_columnconfigure(2, weight=1)
 
+    def _build_pair_tab(self):
+        f = self.tab_pair
+        pad = {"padx": 8, "pady": 6}
+
+        ttk.Label(f, text="Align channel 1 in Folder B to Folder A by registering channel 0 between matching TIFFs.").grid(row=0, column=0, columnspan=6, sticky="w", **pad)
+
+        ttk.Label(f, text="Dataset A (fixed, channel 0 reference):").grid(row=1, column=0, sticky="w", **pad)
+        self.pair_dir_a = tk.StringVar(value=os.path.join(os.getcwd(), "4"))
+        ttk.Entry(f, textvariable=self.pair_dir_a, width=70).grid(row=1, column=1, columnspan=3, sticky="we", **pad)
+        ttk.Button(f, text="Browse…", command=lambda: self._choose_dir(self.pair_dir_a)).grid(row=1, column=4, sticky="w", **pad)
+
+        ttk.Label(f, text="Dataset B (moving, channel 1 corrected):").grid(row=2, column=0, sticky="w", **pad)
+        self.pair_dir_b = tk.StringVar(value=os.path.join(os.getcwd(), "4-2"))
+        ttk.Entry(f, textvariable=self.pair_dir_b, width=70).grid(row=2, column=1, columnspan=3, sticky="we", **pad)
+        ttk.Button(f, text="Browse…", command=lambda: self._choose_dir(self.pair_dir_b)).grid(row=2, column=4, sticky="w", **pad)
+
+        ttk.Label(f, text="Filename pattern:").grid(row=3, column=0, sticky="w", **pad)
+        self.pair_pattern = tk.StringVar(value="*.tif")
+        ttk.Entry(f, textvariable=self.pair_pattern, width=16).grid(row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(f, text="Output folder:").grid(row=4, column=0, sticky="w", **pad)
+        self.pair_outdir = tk.StringVar(value=os.path.join(os.getcwd(), "aligned_channel1"))
+        ttk.Entry(f, textvariable=self.pair_outdir, width=70).grid(row=4, column=1, columnspan=3, sticky="we", **pad)
+        ttk.Button(f, text="Browse…", command=lambda: self._choose_dir(self.pair_outdir)).grid(row=4, column=4, sticky="w", **pad)
+
+        ttk.Label(f, text="Reference channel index:").grid(row=5, column=0, sticky="w", **pad)
+        self.pair_ref = tk.StringVar(value="0")
+        tk.Spinbox(f, from_=0, to=15, increment=1, textvariable=self.pair_ref, width=6).grid(row=5, column=1, sticky="w", **pad)
+
+        ttk.Label(f, text="Target channel index (aligned):").grid(row=5, column=2, sticky="w", **pad)
+        self.pair_target = tk.StringVar(value="1")
+        tk.Spinbox(f, from_=0, to=15, increment=1, textvariable=self.pair_target, width=6).grid(row=5, column=3, sticky="w", **pad)
+
+        self.pair_crop = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Crop to common overlap", variable=self.pair_crop).grid(row=6, column=0, sticky="w", **pad)
+
+        ttk.Label(f, text="Upsample factor:").grid(row=6, column=1, sticky="e", **pad)
+        self.pair_upsample = tk.StringVar(value="10")
+        tk.Spinbox(f, from_=1, to=50, increment=1, textvariable=self.pair_upsample, width=6).grid(row=6, column=2, sticky="w", **pad)
+
+        ttk.Label(f, text="Interpolation order:").grid(row=6, column=3, sticky="e", **pad)
+        self.pair_interp = tk.StringVar(value="1")
+        tk.Spinbox(f, from_=0, to=5, increment=1, textvariable=self.pair_interp, width=6).grid(row=6, column=4, sticky="w", **pad)
+
+        self.pair_prog = ttk.Progressbar(f, orient="horizontal", mode="determinate")
+        self.pair_prog.grid(row=7, column=0, columnspan=6, sticky="we", padx=8, pady=(6, 4))
+
+        btn_row = ttk.Frame(f)
+        btn_row.grid(row=8, column=0, columnspan=6, sticky="w", padx=8, pady=4)
+        self.btn_runpair = ttk.Button(btn_row, text="Run pair alignment", command=self._on_run_pair)
+        self.btn_stop_pair = ttk.Button(btn_row, text="Stop", command=self._on_stop, state="disabled")
+        self.btn_help_pair = ttk.Button(btn_row, text="Help", command=self._on_help_pair)
+        self.btn_quit_pair = ttk.Button(btn_row, text="Quit", command=self._on_close)
+        self.btn_runpair.pack(side="left", padx=(0, 6))
+        self.btn_stop_pair.pack(side="left", padx=(0, 6))
+        self.btn_help_pair.pack(side="left", padx=(0, 6))
+        self.btn_quit_pair.pack(side="left")
+
+        ttk.Label(f, text="Log").grid(row=9, column=0, sticky="w", **pad)
+        self.pair_log = ScrolledText(f, width=120, height=14, state="disabled")
+        self.pair_log.grid(row=10, column=0, columnspan=6, sticky="nsew", padx=8, pady=(0, 8))
+        f.grid_rowconfigure(10, weight=1)
+        f.grid_columnconfigure(3, weight=1)
+
     def _on_run_mc(self):
         if self._mc_thread and self._mc_thread.is_alive():
             return
@@ -911,7 +1132,7 @@ class ChannelAlignApp(tk.Tk):
                 order = int(self.mc_order.get() or 1)
                 ref_index = int(self.mc_ref.get() or 0)
             except Exception:
-                self._post_log_mc("⚠️  Invalid numeric options for upsample/order/ref index.")
+                self._post_log_mc("Invalid numeric options for upsample/order/ref index.")
                 return
             crop_overlap = bool(self.mc_crop.get())
             name_list = [s.strip() for s in (self.mc_names.get() or "").split(',') if s.strip()]
@@ -925,7 +1146,7 @@ class ChannelAlignApp(tk.Tk):
 
             for i, fp in enumerate(sorted(files, key=natural_sort_key)):
                 if self._stop_event.is_set():
-                    self._post_log_mc("🛑 Stopping before next file as requested.")
+                    self._post_log_mc("Stopping before next file as requested.")
                     break
                 try:
                     self._post_log_mc(f"\n[{i+1}/{total}] Aligning file: {fp}")
@@ -934,7 +1155,7 @@ class ChannelAlignApp(tk.Tk):
                         raise ValueError(f"File '{fp}' does not appear to have multiple channels (shape={arr.shape}).")
                     ch_axis = detect_channel_axis(arr)
                     if name_list and len(name_list) != arr.shape[ch_axis]:
-                        self._post_log_mc(f"  ⚠️ Provided {len(name_list)} channel names but file has {arr.shape[ch_axis]} channels; ignoring provided names.")
+                        self._post_log_mc(f"Provided {len(name_list)} channel names but file has {arr.shape[ch_axis]} channels; ignoring provided names.")
                         ch_names = None
                     else:
                         ch_names = name_list if name_list else None
@@ -985,8 +1206,98 @@ class ChannelAlignApp(tk.Tk):
             "• Registration is translation‑only; images can be cropped to the common overlap."
         )
 
+    def _on_run_pair(self):
+        if self._pair_thread and self._pair_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self.pair_prog.configure(value=0, maximum=100)
+        self._toggle_run_buttons(True, "pair")
+        self._append_log(self.pair_log, "\n— Starting Dataset pair alignment —")
+        self._pair_thread = threading.Thread(target=self._run_pair_thread, daemon=True)
+        self._pair_thread.start()
+
+    def _run_pair_thread(self):
+        try:
+            dir_a = (self.pair_dir_a.get() or "").strip()
+            dir_b = (self.pair_dir_b.get() or "").strip()
+            pattern = (self.pair_pattern.get() or "*.tif").strip()
+            outdir = (self.pair_outdir.get() or "").strip()
+            if not dir_a or not dir_b:
+                self._post_log_pair("⚠️  Please choose both Dataset A and Dataset B folders.")
+                return
+            if not outdir:
+                self._post_log_pair("⚠️  Please choose an output folder.")
+                return
+            if not os.path.isdir(dir_a):
+                self._post_log_pair(f"⚠️  Dataset A folder does not exist: {dir_a}")
+                return
+            if not os.path.isdir(dir_b):
+                self._post_log_pair(f"⚠️  Dataset B folder does not exist: {dir_b}")
+                return
+            try:
+                ref_index = int(self.pair_ref.get() or 0)
+                target_index = int(self.pair_target.get() or 1)
+                upsample = int(self.pair_upsample.get() or 10)
+                interp = int(self.pair_interp.get() or 1)
+            except Exception:
+                self._post_log_pair("⚠️  Invalid numeric options for reference/target/upsample/interpolation.")
+                return
+            crop = bool(self.pair_crop.get())
+
+            files_a = list_tiff_files(dir_a, pattern)
+            files_b = list_tiff_files(dir_b, pattern)
+            if not files_a:
+                self._post_log_pair(f"⚠️  No files matching '{pattern}' found in {dir_a}.")
+                return
+            if not files_b:
+                self._post_log_pair(f"⚠️  No files matching '{pattern}' found in {dir_b}.")
+                return
+            total = min(len(files_a), len(files_b))
+            if total == 0:
+                self._post_log_pair("⚠️  No overlapping file pairs to process.")
+                return
+            if len(files_a) != len(files_b):
+                self._post_log_pair(f"⚠️  File counts differ ({len(files_a)} vs {len(files_b)}); aligning first {total} pairs.")
+            self.after(0, lambda: self.pair_prog.configure(value=0, maximum=total))
+
+            def progress_cb(done: int, total_pairs: int):
+                self.after(0, lambda: self.pair_prog.configure(value=done, maximum=max(total_pairs, 1)))
+
+            align_channel1_between_dirs(
+                fixed_dir=dir_a,
+                moving_dir=dir_b,
+                out_dir=outdir,
+                pattern=pattern,
+                ref_index=ref_index,
+                target_index=target_index,
+                upsample_factor=upsample,
+                interpolation_order=interp,
+                crop_to_overlap=crop,
+                log_print=self._post_log_pair,
+                progress_cb=progress_cb
+            )
+            self._post_log_pair("🎉 Dataset pair alignment complete.")
+        except Exception as exc:
+            self._post_log_pair(f"❌ ERROR: {exc}")
+        finally:
+            self.after(0, lambda: self._toggle_run_buttons(False, "pair"))
+
+    def _on_help_pair(self):
+        messagebox.showinfo(
+            "Help — Dataset pair",
+            "Align channel 1 across two folders that share a channel 0 reference:\n"
+            "1) Point Dataset A to the fixed/reference folder (channel 0).\n"
+            "2) Point Dataset B to the moving folder that requires correction.\n"
+            "3) Ensure files match by sorted order; adjust the filename pattern if needed.\n"
+            "4) Set channel indices (defaults: reference 0, target 1), output folder, and options.\n"
+            "5) Click 'Run pair alignment'.\n\n"
+            "Each pair produces aligned channel-1 TIFFs, QC overlays, and a CSV log."
+        )
+
     def _on_close(self):
-        if (self._batch_thread and self._batch_thread.is_alive()) or (self._mc_thread and self._mc_thread.is_alive()):
+        if ((self._batch_thread and self._batch_thread.is_alive()) or
+                (self._mc_thread and self._mc_thread.is_alive()) or
+                (self._pair_thread and self._pair_thread.is_alive())):
             if not messagebox.askyesno("Quit", "A task is still running. Stop and quit?"):
                 return
             self._stop_event.set()
