@@ -672,6 +672,29 @@ class ChannelAlignApp(tk.Tk):
         except Exception:
             pass
 
+        # Ensure button text is visible across different Tk themes/platforms.
+        # Some macOS / third-party themes render ttk button text with the same
+        # color as the button background (appearing invisible). Configure a
+        # sensible default foreground and provide a conservative macOS fallback.
+        try:
+            style = ttk.Style(self)
+            # Try to set a clear, high-contrast foreground for enabled buttons.
+            style.configure("TButton", foreground="#000000")
+            style.map("TButton",
+                      foreground=[("disabled", "#6b6b6b"), ("!disabled", "#000000")])
+            # On some macOS Tk builds the native theme ignores foreground colors;
+            # fallback to a theme that respects styling which also looks reasonable.
+            if sys.platform == "darwin":
+                try:
+                    style.theme_use("clam")
+                    style.configure("TButton", foreground="#000000", background="#f0f0f0")
+                except Exception:
+                    # If switching theme fails, continue without crashing.
+                    pass
+        except Exception:
+            # Never let style issues prevent the GUI from launching.
+            pass
+
         self.notebook = ttk.Notebook(self)
         self.tab_batch = ttk.Frame(self.notebook)
         self.tab_mc = ttk.Frame(self.notebook)
