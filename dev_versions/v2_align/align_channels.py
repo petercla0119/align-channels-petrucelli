@@ -8,12 +8,18 @@ NO FIJI/ImageJ required.
 
 import argparse
 import logging
+import re
 import shutil
 import sys
 from collections import defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from src.pipeline import align_two_channel_images, PipelineError
+
+
+# Shared filename for combined STDOUT + log capture
+RUN_LOG_FILENAME = "run.log"
 def collect_image_files(directory: Path) -> list[Path]:
     """Return list of TIFF files under directory (recursive)."""
     patterns = ('*.tif', '*.tiff', '*.TIF', '*.TIFF')
@@ -32,10 +38,169 @@ def collect_image_files(directory: Path) -> list[Path]:
 
 def pairing_key(path: Path) -> str:
     """Extract pairing key from filename (substring before first '-')."""
-    name = path.name
+    name = path.stem
     if '-' in name:
         return name.split('-', 1)[0]
-    return Path(name).stem
+    return name
+
+
+PAIRING_STRIP_TOKENS = (
+    'fixed',
+    'moving',
+    'aligned',
+    'align',
+    'dapi',
+    'protein',
+    'marker',
+    'nuclei',
+    'before',
+    'after',
+    'channel'
+)
+
+
+def normalize_pairing_key(raw_key: str) -> str:
+    """Normalize key by stripping channel labels and punctuation for loose matching."""
+    normalized = raw_key.lower()
+    for token in PAIRING_STRIP_TOKENS:
+        normalized = normalized.replace(token, '')
+    normalized = re.sub(r'ch[0-9]+', '', normalized)
+    normalized = re.sub(r'[^a-z0-9]+', '', normalized)
+    return normalized or raw_key.lower()
+
+
+def print_and_log_block(lines: list[str]) -> None:
+    """Emit identical block to stdout and the active logger."""
+    block = "\n".join(lines)
+    print(block)
+    logging.getLogger(__name__).info(block)
+
+
+def build_batch_records(files: list[Path]) -> tuple[list[dict], dict[str, list[Path]]]:
+    """Create metadata records for batch matching (handles duplicate primary keys)."""
+    records: list[dict] = []
+    primary_groups: defaultdict[str, list[dict]] = defaultdict(list)
+    duplicates: dict[str, list[Path]] = {}
+    
+    for file_path in files:
+        primary_key = pairing_key(file_path)
+        record = {
+            'path': file_path,
+            'primary_key': primary_key,
+            'full_key': file_path.stem
+        }
+        primary_groups[primary_key].append(record)
+        records.append(record)
+    
+    for primary_key, group in primary_groups.items():
+        if len(group) == 1:
+            rec = group[0]
+            rec['key'] = rec['primary_key']
+            rec['normalized'] = normalize_pairing_key(rec['key'])
+            rec['key_strategy'] = 'primary'
+        else:
+            duplicates[primary_key] = [rec['path'] for rec in group]
+            for rec in group:
+                rec['key'] = rec['full_key']
+                rec['normalized'] = normalize_pairing_key(rec['key'])
+                rec['key_strategy'] = 'full_stem'
+    
+    return records, duplicates
+
+
+def match_batch_file_pairs(
+    fixed_records: list[dict],
+    moving_records: list[dict]
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Attempt to pair fixed/moving records using increasingly loose rules.
+    
+    Returns:
+        matched_pairs: list of dicts with keys (key, fixed, moving, match_type, score)
+        unmatched_fixed: list of unused fixed records
+        unmatched_moving: list of unused moving records
+    """
+    matched_pairs: list[dict] = []
+    used_fixed_keys: set[str] = set()
+    used_moving_keys: set[str] = set()
+    
+    fixed_by_key = {rec['key']: rec for rec in fixed_records}
+    moving_by_key = {rec['key']: rec for rec in moving_records}
+    
+    # Stage 1: exact key match
+    for key in sorted(set(fixed_by_key.keys()) & set(moving_by_key.keys())):
+        fixed_rec = fixed_by_key[key]
+        moving_rec = moving_by_key[key]
+        matched_pairs.append({
+            'key': key,
+            'fixed': fixed_rec['path'],
+            'moving': moving_rec['path'],
+            'match_type': 'exact',
+            'score': 1.0
+        })
+        used_fixed_keys.add(key)
+        used_moving_keys.add(key)
+    
+    # Stage 2: normalized match (ignore channel tokens)
+    fixed_norm_map = defaultdict(list)
+    for rec in fixed_records:
+        if rec['key'] in used_fixed_keys:
+            continue
+        fixed_norm_map[rec['normalized']].append(rec)
+    
+    for moving_rec in moving_records:
+        if moving_rec['key'] in used_moving_keys:
+            continue
+        norm = moving_rec['normalized']
+        candidates = fixed_norm_map.get(norm)
+        while candidates and candidates[0]['key'] in used_fixed_keys:
+            candidates.pop(0)
+        if candidates:
+            fixed_rec = candidates.pop(0)
+            matched_pairs.append({
+                'key': fixed_rec['key'],
+                'fixed': fixed_rec['path'],
+                'moving': moving_rec['path'],
+                'match_type': 'normalized',
+                'score': 1.0
+            })
+            used_fixed_keys.add(fixed_rec['key'])
+            used_moving_keys.add(moving_rec['key'])
+            if not candidates:
+                fixed_norm_map.pop(norm, None)
+    
+    # Stage 3: fuzzy ratio on normalized strings
+    remaining_fixed = [rec for rec in fixed_records if rec['key'] not in used_fixed_keys]
+    remaining_moving = [rec for rec in moving_records if rec['key'] not in used_moving_keys]
+    
+    for moving_rec in remaining_moving:
+        best_rec = None
+        best_ratio = 0.0
+        for fixed_rec in remaining_fixed:
+            ratio = SequenceMatcher(
+                None,
+                moving_rec['normalized'],
+                fixed_rec['normalized']
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_rec = fixed_rec
+        if best_rec and best_ratio >= 0.6:
+            matched_pairs.append({
+                'key': best_rec['key'],
+                'fixed': best_rec['path'],
+                'moving': moving_rec['path'],
+                'match_type': 'fuzzy',
+                'score': best_ratio
+            })
+            used_fixed_keys.add(best_rec['key'])
+            used_moving_keys.add(moving_rec['key'])
+            remaining_fixed.remove(best_rec)
+    
+    unmatched_fixed = [rec for rec in fixed_records if rec['key'] not in used_fixed_keys]
+    unmatched_moving = [rec for rec in moving_records if rec['key'] not in used_moving_keys]
+    
+    return matched_pairs, unmatched_fixed, unmatched_moving
 
 
 def run_batch_alignments(
@@ -57,47 +222,92 @@ def run_batch_alignments(
     fixed_files = collect_image_files(fixed_dir)
     moving_files = collect_image_files(moving_dir)
     
-    fixed_map = {}
-    duplicates_fixed = defaultdict(list)
-    for f in fixed_files:
-        key = pairing_key(f)
-        if key in fixed_map:
-            duplicates_fixed[key].append(f)
-        else:
-            fixed_map[key] = f
+    fixed_records, duplicates_fixed_primary = build_batch_records(fixed_files)
+    moving_records, duplicates_moving_primary = build_batch_records(moving_files)
     
-    moving_map = {}
-    duplicates_moving = defaultdict(list)
-    for f in moving_files:
-        key = pairing_key(f)
-        if key in moving_map:
-            duplicates_moving[key].append(f)
+    fixed_by_key = {}
+    duplicate_keys_fixed = defaultdict(list)
+    for record in fixed_records:
+        key = record['key']
+        if key in fixed_by_key:
+            duplicate_keys_fixed[key].append(record['path'])
         else:
-            moving_map[key] = f
+            fixed_by_key[key] = record
+    
+    moving_by_key = {}
+    duplicate_keys_moving = defaultdict(list)
+    for record in moving_records:
+        key = record['key']
+        if key in moving_by_key:
+            duplicate_keys_moving[key].append(record['path'])
+        else:
+            moving_by_key[key] = record
     
     summary = {
         'pairs_total': 0,
         'success_count': 0,
         'failure_count': 0,
         'skipped_existing': [],
-        'missing_from_fixed': sorted(set(moving_map.keys()) - set(fixed_map.keys())),
-        'missing_from_moving': sorted(set(fixed_map.keys()) - set(moving_map.keys())),
+        'missing_from_fixed': [],
+        'missing_from_moving': [],
         'failures': {},
     }
     
-    common_keys = sorted(set(fixed_map.keys()) & set(moving_map.keys()))
-    summary['pairs_total'] = len(common_keys)
+    matched_pairs, unmatched_fixed, unmatched_moving = match_batch_file_pairs(
+        fixed_records,
+        moving_records
+    )
+    summary['pairs_total'] = len(matched_pairs)
+    summary['missing_from_fixed'] = sorted({rec['path'].name for rec in unmatched_moving})
+    summary['missing_from_moving'] = sorted({rec['path'].name for rec in unmatched_fixed})
     
-    for key in sorted(duplicates_fixed):
-        logger.warning(f"Multiple fixed images for key '{key}'; using {fixed_map[key]}, skipping {duplicates_fixed[key]}")
-    for key in sorted(duplicates_moving):
-        logger.warning(f"Multiple moving images for key '{key}'; using {moving_map[key]}, skipping {duplicates_moving[key]}")
+    for primary_key in sorted(duplicates_fixed_primary):
+        logger.warning(
+            "Fixed directory has multiple files with primary key '%s'; switched to full filename stems: %s",
+            primary_key,
+            [path.name for path in duplicates_fixed_primary[primary_key]]
+        )
+    for primary_key in sorted(duplicates_moving_primary):
+        logger.warning(
+            "Moving directory has multiple files with primary key '%s'; switched to full filename stems: %s",
+            primary_key,
+            [path.name for path in duplicates_moving_primary[primary_key]]
+        )
     
-    logger.info(f"Found {len(common_keys)} matching image pairs")
+    for key in sorted(duplicate_keys_fixed):
+        logger.error(
+            "Unexpected duplicate fixed key even after fallback '%s': %s",
+            key,
+            duplicate_keys_fixed[key]
+        )
+    for key in sorted(duplicate_keys_moving):
+        logger.error(
+            "Unexpected duplicate moving key even after fallback '%s': %s",
+            key,
+            duplicate_keys_moving[key]
+        )
     
-    for key in common_keys:
-        fixed_path = fixed_map[key]
-        moving_path = moving_map[key]
+    logger.info(f"Found {len(matched_pairs)} matching image pairs")
+    
+    for pair in matched_pairs:
+        key = pair['key']
+        fixed_path = pair['fixed']
+        moving_path = pair['moving']
+        if pair['match_type'] == 'normalized':
+            logger.info(
+                "[%s] Matched by normalized filename: %s ↔ %s",
+                key,
+                fixed_path.name,
+                moving_path.name
+            )
+        elif pair['match_type'] == 'fuzzy':
+            logger.warning(
+                "[%s] Using fuzzy filename match: %s ↔ %s (score %.2f)",
+                key,
+                fixed_path.name,
+                moving_path.name,
+                pair['score']
+            )
         pair_output = output_root / key
         
         if pair_output.exists():
@@ -129,40 +339,50 @@ def run_batch_alignments(
 
 
 def summarize_batch_results(summary: dict) -> None:
-    print("\n" + "=" * 70)
-    print("BATCH ALIGNMENT SUMMARY")
-    print("=" * 70)
-    print(f"Total pairs considered : {summary['pairs_total']}")
-    print(f"Successful alignments   : {summary['success_count']}")
-    print(f"Failures                : {summary['failure_count']}")
-    print(f"Skipped (existing out.) : {len(summary['skipped_existing'])}")
+    lines = [
+        "",
+        "=" * 70,
+        "BATCH ALIGNMENT SUMMARY",
+        "=" * 70,
+        f"Total pairs considered : {summary['pairs_total']}",
+        f"Successful alignments   : {summary['success_count']}",
+        f"Failures                : {summary['failure_count']}",
+        f"Skipped (existing out.) : {len(summary['skipped_existing'])}"
+    ]
     
     if summary['missing_from_fixed']:
-        print("\nMoving images missing matching fixed images for keys:")
+        lines.append("")
+        lines.append("Moving images missing matching fixed images for keys:")
         for key in summary['missing_from_fixed']:
-            print(f"  - {key}")
+            lines.append(f"  - {key}")
     
     if summary['missing_from_moving']:
-        print("\nFixed images missing matching moving images for keys:")
+        lines.append("")
+        lines.append("Fixed images missing matching moving images for keys:")
         for key in summary['missing_from_moving']:
-            print(f"  - {key}")
+            lines.append(f"  - {key}")
     
     if summary['skipped_existing']:
-        print("\nSkipped pairs (output already exists):")
+        lines.append("")
+        lines.append("Skipped pairs (output already exists):")
         for path in summary['skipped_existing']:
-            print(f"  - {path}")
+            lines.append(f"  - {path}")
     
     if summary['failures']:
-        print("\nFailures:")
+        lines.append("")
+        lines.append("Failures:")
         for key, reason in summary['failures'].items():
-            print(f"  - {key}: {reason}")
+            lines.append(f"  - {key}: {reason}")
     
-    print("=" * 70 + "\n")
+    lines.append("=" * 70)
+    lines.append("")
+    
+    print_and_log_block(lines)
 
 
 
-def setup_logging(verbose: bool = False, debug: bool = False) -> None:
-    """Configure logging based on verbosity level."""
+def setup_logging(verbose: bool = False, debug: bool = False) -> tuple[int, str, str]:
+    """Configure console logging; return level and format for optional file handler."""
     if debug:
         level = logging.DEBUG
         format_str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -172,12 +392,35 @@ def setup_logging(verbose: bool = False, debug: bool = False) -> None:
     else:
         level = logging.WARNING
         format_str = '%(levelname)s: %(message)s'
-    
+    date_format = '%Y-%m-%d %H:%M:%S'
+
     logging.basicConfig(
         level=level,
         format=format_str,
-        datefmt='%Y-%m-%d %H:%M:%S'
+        datefmt=date_format,
+        handlers=[logging.StreamHandler(sys.stdout)]
     )
+    return level, format_str, date_format
+
+
+def attach_file_logger(
+    log_path: Path,
+    level: int,
+    format_str: str,
+    date_format: str
+) -> Path | None:
+    """Attach file handler to root logger."""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(format_str, datefmt=date_format))
+        logging.getLogger().addHandler(handler)
+        logging.getLogger(__name__).info("Writing detailed logs to %s", log_path)
+        return log_path
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Could not create log file %s: %s", log_path, exc)
+        return None
 
 
 def main():
@@ -309,9 +552,11 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
     args = parser.parse_args()
     
     # Setup logging
-    setup_logging(verbose=args.verbose, debug=args.debug)
+    log_level, log_format, log_datefmt = setup_logging(verbose=args.verbose, debug=args.debug)
     
     logger = logging.getLogger(__name__)
+    file_log_path: Path | None = None
+    output_root = Path(args.output)
     
     # Determine mode (single vs batch)
     batch_mode = args.batch_fixed_dir and args.batch_moving_dir
@@ -326,9 +571,17 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
             logger.error(f"Batch moving directory not found: {moving_dir}")
             sys.exit(1)
         
+        file_log_path = attach_file_logger(
+            output_root / RUN_LOG_FILENAME,
+            log_level,
+            log_format,
+            log_datefmt
+        )
         logger.info("Batch mode enabled")
         logger.info(f"  Fixed dir : {fixed_dir}")
         logger.info(f"  Moving dir: {moving_dir}")
+        if file_log_path:
+            logger.info("Log file saved to: %s", file_log_path)
     else:
         if not args.fixed or not args.moving:
             logger.error("Single-run mode requires --fixed and --moving arguments (or use --batch-fixed-dir/--batch-moving-dir)")
@@ -347,6 +600,18 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
         if not moving_path.exists():
             logger.error(f"Moving image not found: {moving_path}")
             sys.exit(1)
+        
+        file_log_path = attach_file_logger(
+            output_root / RUN_LOG_FILENAME,
+            log_level,
+            log_format,
+            log_datefmt
+        )
+        logger.info("Single-run mode enabled")
+        if file_log_path:
+            logger.info("Log file saved to: %s", file_log_path)
+        logger.info("Fixed input path : %s (filename: %s)", fixed_path, fixed_path.name)
+        logger.info("Moving input path: %s (filename: %s)", moving_path, moving_path.name)
     
     # Validate transform file if provided
     transform_file_path = None
@@ -370,6 +635,7 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
                 overwrite=args.batch_overwrite
             )
             summarize_batch_results(results)
+            logger.info("Batch outputs written under: %s", Path(args.output))
             sys.exit(0 if results['success_count'] else 1)
         
         logger.info("Starting alignment pipeline...")
@@ -383,22 +649,31 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
             transform_file=str(transform_file_path) if transform_file_path else None
         )
         
-        # Print summary
-        print("\n" + "="*60)
-        print("ALIGNMENT SUCCESSFUL!")
-        print("="*60)
-        print(f"Transform type:    {results['transform_type']}")
-        print(f"Registration:      {results['registration_method']}")
-        print(f"Landmarks found:   {results['num_landmarks']}")
-        print(f"Rotation angle:    {results['rotation_angle_degrees']:.3f}°")
-        print(f"Processing time:   {results['elapsed_time_seconds']:.2f}s")
-        print(f"\nOutput directory:  {results['output_directory']}")
-        print("\nGenerated files:")
+        single_lines = [
+            "",
+            "="*60,
+            "ALIGNMENT SUCCESSFUL!",
+            "="*60,
+            f"Transform type:    {results['transform_type']}",
+            f"Registration:      {results['registration_method']}",
+            f"Landmarks found:   {results['num_landmarks']}",
+            f"Rotation angle:    {results['rotation_angle_degrees']:.3f}°",
+            f"Processing time:   {results['elapsed_time_seconds']:.2f}s",
+            "",
+            f"Output directory:  {results['output_directory']}",
+            "",
+            "Generated files:"
+        ]
         for category, files in results['files_created'].items():
-            print(f"  {category}/")
+            single_lines.append(f"  {category}/")
             for f in files:
-                print(f"    - {f}")
-        print("="*60)
+                single_lines.append(f"    - {f}")
+        single_lines.append("="*60)
+        print_and_log_block(single_lines)
+        if not batch_mode:
+            logger.info("Alignment outputs saved to: %s", results['output_directory'])
+            logger.info("Fixed input confirmed: %s", fixed_path)
+            logger.info("Moving input confirmed: %s", moving_path)
         
         sys.exit(0)
         
@@ -415,4 +690,3 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
 
 if __name__ == '__main__':
     main()
-
