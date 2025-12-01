@@ -608,7 +608,7 @@ def register_dapi_channels(
     Args:
         fixed_dapi: Fixed/reference DAPI channel (H, W)
         moving_dapi: Moving DAPI channel to align (H, W)
-        method: 'ecc' (default, robust) or 'phase' (translation only)
+        method: 'ecc' (default, robust), 'phase' (translation only), or 'hybrid' (ECC with phase fallback)
         transform_type: 'TRANSLATION', 'RIGID_BODY', 'SCALED_ROTATION', or 'AFFINE'
         
     Returns:
@@ -628,8 +628,29 @@ def register_dapi_channels(
         # Phase correlation (translation only)
         shift, error = register_images_phase_correlation(fixed_dapi, moving_dapi)
         
-        # Create single landmark pair representing the shift
+        # Detect and fix wrapping artifacts
+        # If shift is > 20% of image dimensions, it's likely wrapped
+        # Most microscopy shifts should be < 100 pixels for well-aligned images
         h, w = fixed_dapi.shape
+        shift_threshold_percent = 0.2  # 20% of image size
+        shift_threshold_pixels = 200  # Absolute pixel threshold
+        
+        if (abs(shift[0]) > h * shift_threshold_percent or abs(shift[1]) > w * shift_threshold_percent or 
+            abs(shift[0]) > shift_threshold_pixels or abs(shift[1]) > shift_threshold_pixels):
+            logger.warning(f"  Phase correlation detected large shift (y={shift[0]:.1f}, x={shift[1]:.1f}), checking for wrapping...")
+            # Try complement shift (subtract from image dimensions)
+            alt_shift_y = shift[0] - h if shift[0] > 0 else shift[0] + h
+            alt_shift_x = shift[1] - w if shift[1] > 0 else shift[1] + w
+            
+            # Use the smaller absolute shift
+            if abs(alt_shift_y) < abs(shift[0]):
+                shift[0] = alt_shift_y
+                logger.warning(f"  Corrected Y shift to: {shift[0]:.1f} (unwrapped from periodic boundary)")
+            if abs(alt_shift_x) < abs(shift[1]):
+                shift[1] = alt_shift_x
+                logger.warning(f"  Corrected X shift to: {shift[1]:.1f} (unwrapped from periodic boundary)")
+        
+        # Create single landmark pair representing the shift
         center = np.array([[w / 2, h / 2]])
         src_landmarks = center.copy()
         dst_landmarks = center + shift[::-1]  # Flip from (y, x) to (x, y)
@@ -643,6 +664,70 @@ def register_dapi_channels(
             'shift': shift,
             'error': error
         }
+        
+    elif method == 'hybrid':
+        # Hybrid: Try ECC first, fall back to phase correlation if it fails
+        try:
+            logger.info("  Attempting ECC registration...")
+            warp_matrix, correlation = register_images_ecc(
+                fixed_dapi,
+                moving_dapi,
+                transform_type=transform_type
+            )
+            
+            # Convert warp matrix to landmarks for compatibility
+            src_landmarks, dst_landmarks = warp_matrix_to_landmarks(
+                warp_matrix,
+                fixed_dapi.shape,
+                transform_type
+            )
+            
+            return {
+                'src_landmarks': src_landmarks,
+                'dst_landmarks': dst_landmarks,
+                'transform_type': transform_type,
+                'method': 'ecc',
+                'num_matches': len(src_landmarks),
+                'warp_matrix': warp_matrix,
+                'correlation': correlation
+            }
+        except RegistrationError as e:
+            logger.warning(f"  ECC failed ({e}), falling back to phase correlation...")
+            
+            # Fall back to phase correlation with wrapping correction
+            shift, error = register_images_phase_correlation(fixed_dapi, moving_dapi)
+            
+            # Detect and fix wrapping artifacts
+            h, w = fixed_dapi.shape
+            shift_threshold_percent = 0.2  # 20% of image size
+            shift_threshold_pixels = 200  # Absolute pixel threshold
+            
+            if (abs(shift[0]) > h * shift_threshold_percent or abs(shift[1]) > w * shift_threshold_percent or 
+                abs(shift[0]) > shift_threshold_pixels or abs(shift[1]) > shift_threshold_pixels):
+                logger.warning(f"  Phase correlation detected large shift (y={shift[0]:.1f}, x={shift[1]:.1f}), checking for wrapping...")
+                alt_shift_y = shift[0] - h if shift[0] > 0 else shift[0] + h
+                alt_shift_x = shift[1] - w if shift[1] > 0 else shift[1] + w
+                
+                if abs(alt_shift_y) < abs(shift[0]):
+                    shift[0] = alt_shift_y
+                    logger.warning(f"  Corrected Y shift to: {shift[0]:.1f} (unwrapped from periodic boundary)")
+                if abs(alt_shift_x) < abs(shift[1]):
+                    shift[1] = alt_shift_x
+                    logger.warning(f"  Corrected X shift to: {shift[1]:.1f} (unwrapped from periodic boundary)")
+            
+            center = np.array([[w / 2, h / 2]])
+            src_landmarks = center.copy()
+            dst_landmarks = center + shift[::-1]
+            
+            return {
+                'src_landmarks': src_landmarks,
+                'dst_landmarks': dst_landmarks,
+                'transform_type': 'TRANSLATION',
+                'method': 'phase_correlation_fallback',
+                'num_matches': 1,
+                'shift': shift,
+                'error': error
+            }
         
     elif method == 'ecc':
         # ECC (Enhanced Correlation Coefficient) - intensity-based registration
@@ -670,5 +755,5 @@ def register_dapi_channels(
         }
         
     else:
-        raise RegistrationError(f"Unknown registration method: {method}. Choose from: phase, ecc")
+        raise RegistrationError(f"Unknown registration method: {method}. Choose from: phase, ecc, hybrid")
 

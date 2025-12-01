@@ -210,7 +210,8 @@ def run_batch_alignments(
     transform_type: str,
     registration_method: str,
     transform_file: str | None,
-    overwrite: bool
+    overwrite: bool,
+    invert_transform: bool = False
 ) -> dict:
     logger = logging.getLogger(__name__)
     
@@ -327,7 +328,8 @@ def run_batch_alignments(
                 output_dir=str(pair_output),
                 transform_type=transform_type,
                 registration_method=registration_method,
-                transform_file=None
+                transform_file=None,
+                invert_transform=invert_transform
             )
             summary['success_count'] += 1
         except Exception as exc:  # noqa: BLE001
@@ -506,9 +508,15 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
     parser.add_argument(
         '--method',
         type=str,
-        default='ecc',
-        choices=['ecc', 'phase'],
-        help='Registration method: ecc=Enhanced Correlation Coefficient (default, robust), phase=translation only. Ignored if --transform-file is provided.'
+        default='hybrid',
+        choices=['ecc', 'phase', 'hybrid'],
+        help='Registration method: hybrid=ECC with phase fallback (default), ecc=Enhanced Correlation Coefficient, phase=translation only. Ignored if --transform-file is provided.'
+    )
+    
+    parser.add_argument(
+        '--invert-transform',
+        action='store_true',
+        help='Invert the transformation (swap moving and fixed). Use when alignment direction needs to be reversed.'
     )
     
     parser.add_argument(
@@ -632,7 +640,8 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
                 transform_type=args.transform,
                 registration_method=args.method,
                 transform_file=str(transform_file_path) if transform_file_path else None,
-                overwrite=args.batch_overwrite
+                overwrite=args.batch_overwrite,
+                invert_transform=args.invert_transform
             )
             summarize_batch_results(results)
             logger.info("Batch outputs written under: %s", Path(args.output))
@@ -646,7 +655,8 @@ DEFAULT: RIGID_BODY transform (3 landmarks, rotation + translation, NO scaling)
             output_dir=args.output,
             transform_type=args.transform,
             registration_method=args.method,
-            transform_file=str(transform_file_path) if transform_file_path else None
+            transform_file=str(transform_file_path) if transform_file_path else None,
+            invert_transform=args.invert_transform
         )
         
         single_lines = [

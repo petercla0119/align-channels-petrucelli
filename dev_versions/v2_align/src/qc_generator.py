@@ -50,7 +50,8 @@ def create_overlay(
     img2: np.ndarray,
     color1: str = 'cyan',
     color2: str = 'magenta',
-    percentile_clip: Tuple[float, float] = (1.0, 99.0)
+    percentile_clip: Tuple[float, float] = (1.0, 99.0),
+    mask_zero_regions: bool = True
 ) -> np.ndarray:
     """
     Create a two-color overlay for comparing two grayscale images.
@@ -61,6 +62,7 @@ def create_overlay(
         color1: Color for img1 ('cyan', 'green', 'red', 'blue')
         color2: Color for img2 ('magenta', 'red', 'green', 'blue')
         percentile_clip: Percentile range for contrast adjustment
+        mask_zero_regions: If True, regions where img2 is zero (cropped) will be black, not showing img1
         
     Returns:
         RGB overlay image, shape (H, W, 3), dtype uint8
@@ -69,6 +71,10 @@ def create_overlay(
         raise ValueError(f"Images must have same shape: {img1.shape} vs {img2.shape}")
     
     h, w = img1.shape
+    
+    # Identify zero/cropped regions in img2 (moving image after alignment)
+    # Use a small threshold to account for numerical errors
+    zero_mask = img2 < 1  # Pixels that are essentially zero
     
     # Normalize both images
     img1_norm = normalize_to_8bit(img1, percentile_clip)
@@ -101,6 +107,10 @@ def create_overlay(
     rgb[:, :, 0] = np.clip(img1_norm * r1 + img2_norm * r2, 0, 255).astype(np.uint8)
     rgb[:, :, 1] = np.clip(img1_norm * g1 + img2_norm * g2, 0, 255).astype(np.uint8)
     rgb[:, :, 2] = np.clip(img1_norm * b1 + img2_norm * b2, 0, 255).astype(np.uint8)
+    
+    # Mask out cropped regions (where moving image is zero after transformation)
+    if mask_zero_regions:
+        rgb[zero_mask] = 0  # Set to black where img2 is zero (cropped edges)
     
     logger.info(f"Created overlay: {color1} + {color2}")
     return rgb
@@ -171,14 +181,18 @@ def create_rgb_composite(
 
 def save_rgb_png(
     image: np.ndarray,
-    path: str
+    path: str,
+    downsample_factor: int = 2,
+    quality: int = 85
 ) -> None:
     """
-    Save RGB image as PNG.
+    Save RGB image as PNG with optional downsampling to reduce file size.
     
     Args:
         image: RGB image, shape (H, W, 3), dtype uint8
         path: Output path
+        downsample_factor: Factor to downsample by (2 = half resolution, 1 = no downsampling)
+        quality: JPEG quality if saving as JPEG (not used for PNG, but kept for compatibility)
     """
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"Expected RGB image (H, W, 3), got shape: {image.shape}")
@@ -186,9 +200,18 @@ def save_rgb_png(
     if image.dtype != np.uint8:
         image = image.astype(np.uint8)
     
-    # Save with PIL
+    # Create PIL image
     pil_img = Image.fromarray(image, mode='RGB')
-    pil_img.save(path)
+    
+    # Downsample if requested
+    if downsample_factor > 1:
+        h, w = image.shape[:2]
+        new_size = (w // downsample_factor, h // downsample_factor)
+        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+        logger.info(f"Downsampled from {(w, h)} to {new_size} ({downsample_factor}x)")
+    
+    # Save with compression
+    pil_img.save(path, optimize=True)
     
     logger.info(f"Saved RGB PNG: {path}")
 

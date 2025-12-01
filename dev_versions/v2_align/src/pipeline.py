@@ -79,7 +79,8 @@ def align_two_channel_images(
     output_dir: str,
     transform_type: str = 'RIGID_BODY',  # DEFAULT: 3 landmarks, rotation + translation, NO scaling
     registration_method: str = 'ecc',
-    transform_file: Optional[str] = None
+    transform_file: Optional[str] = None,
+    invert_transform: bool = False
 ) -> Dict:
     """
     Main pipeline: align two 2-channel images and generate all outputs.
@@ -91,6 +92,7 @@ def align_two_channel_images(
         transform_type: Transform model (default RIGID_BODY), ignored if transform_file provided
         registration_method: 'feature' (ORB+RANSAC) or 'phase' (translation only), ignored if transform_file provided
         transform_file: Optional path to MultiStackReg transformation file (skips registration)
+        invert_transform: If True, swap source and destination landmarks (invert transformation)
         
     Returns:
         Dictionary with pipeline results and metrics
@@ -187,15 +189,25 @@ def align_two_channel_images(
         
         # 6. Compute transformation matrix
         logger.info("Step 5/7: Computing transformation matrix...")
+        
+        # Invert transformation if requested (swap source and destination)
+        if invert_transform:
+            logger.warning("  Inverting transformation (swapping source and destination landmarks)")
+            src_landmarks = reg_result['dst_landmarks']
+            dst_landmarks = reg_result['src_landmarks']
+        else:
+            src_landmarks = reg_result['src_landmarks']
+            dst_landmarks = reg_result['dst_landmarks']
+        
         transform_matrix = get_transformation_matrix(
-            reg_result['src_landmarks'],
-            reg_result['dst_landmarks'],
+            src_landmarks,
+            dst_landmarks,
             reg_result['transform_type']
         )
         
         transform_params = rigid_from_landmarks(
-            reg_result['src_landmarks'],
-            reg_result['dst_landmarks']
+            src_landmarks,
+            dst_landmarks
         )
         
         logger.info(f"  Transform type: {transform_params['transform_type']}")
@@ -284,8 +296,9 @@ def align_two_channel_images(
             aligned_protein,    # Ch0 moving after
             aligned_dapi        # Ch1 moving after
         )
-        save_rgb_png(grid_before, str(paths['qc'] / f"{prefix}_overlay_before.png"))
-        save_rgb_png(grid_after, str(paths['qc'] / f"{prefix}_overlay_after.png"))
+        # Save with 2x downsampling to reduce file size (4x reduction in pixels)
+        save_rgb_png(grid_before, str(paths['qc'] / f"{prefix}_overlay_before.png"), downsample_factor=2)
+        save_rgb_png(grid_after, str(paths['qc'] / f"{prefix}_overlay_after.png"), downsample_factor=2)
         
         # 8e. Create RGB composite (DAPI=blue, fixed_protein=green, moving_protein=magenta)
         logger.info("  Creating RGB composite...")
@@ -297,7 +310,8 @@ def align_two_channel_images(
             fixed_color='green',
             moving_color='magenta'
         )
-        save_rgb_png(composite, str(paths['composite'] / f"{prefix}_composite_RGB.png"))
+        # Save with 2x downsampling to reduce file size
+        save_rgb_png(composite, str(paths['composite'] / f"{prefix}_composite_RGB.png"), downsample_factor=2)
         
         # 9. Compute metrics
         elapsed_time = time.time() - start_time
