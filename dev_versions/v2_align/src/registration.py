@@ -368,54 +368,75 @@ def register_images_ecc(
     termination_eps: float = 1e-6,
     gauss_filt_size: int = 5,
     use_pyramid: bool = True,
-    pyramid_levels: int = 5,  # Increased from 3 to 5 for better convergence
-    use_phase_init: bool = True  # Initialize with phase correlation
+    pyramid_levels: int = 5,
+    use_phase_init: bool = True
 ) -> Tuple[np.ndarray, float]:
     """
-    Register two images using ECC (Enhanced Correlation Coefficient).
+    Two-stage ECC registration.
     
-    This is an intensity-based method that works well on images with uniform
-    regions (like fluorescence microscopy). More robust than feature-based
-    methods when features are sparse.
+    Stage 1: Use phase correlation to estimate large translations and
+    pre-align the moving image if the shift magnitude exceeds a threshold.
     
-    Uses multi-scale pyramid approach for better convergence:
-    - Starts at coarse resolution (downsampled)
-    - Progressively refines at finer resolutions
-    - Avoids local minima and improves convergence
-    
-    Improvements (Nov 10, 2025):
-    - Phase correlation initialization for better starting point
-    - 5-level pyramid (vs 3) for more robust coarse-to-fine optimization
-    - Adaptive epsilon per pyramid level (looser at coarse, strict at fine)
-    
-    Args:
-        fixed: Fixed/reference image (H, W)
-        moving: Moving image to align (H, W)
-        transform_type: Transform model ('TRANSLATION', 'RIGID_BODY', 'AFFINE')
-        num_iterations: Maximum iterations per pyramid level
-        termination_eps: Convergence threshold (for finest level)
-        gauss_filt_size: Gaussian filter size for smoothing (1=no filter)
-        use_pyramid: If True, use multi-scale pyramid (recommended)
-        pyramid_levels: Number of pyramid levels (5 = 16x, 8x, 4x, 2x, 1x downsampling)
-        use_phase_init: If True, initialize translation with phase correlation
-        
-    Returns:
-        Tuple of (warp_matrix, correlation_coefficient)
-        - warp_matrix: 2x3 transformation matrix
-        - correlation_coefficient: Final correlation (higher is better)
-    
-    Raises:
-        RegistrationError: If ECC fails to converge
+    Stage 2: Run ECC (optionally multi-scale) to refine rotation/translation.
+    The final warp matrix composes the ECC result with the pre-shift so that
+    we return a transform that maps the ORIGINAL moving image onto the fixed.
     """
     if fixed.shape != moving.shape:
         raise RegistrationError(f"Image shapes don't match: {fixed.shape} vs {moving.shape}")
     
-    logger.info(f"Running ECC registration ({transform_type}, pyramid={use_pyramid}, levels={pyramid_levels}, phase_init={use_phase_init})...")
+    logger.info(
+        "Running two-stage ECC registration (%s, pyramid=%s, levels=%d, phase_init=%s)...",
+        transform_type,
+        use_pyramid,
+        pyramid_levels,
+        use_phase_init
+    )
+    
+    prealign_threshold = 50.0  # pixels
+    pre_shift = np.array([0.0, 0.0], dtype=float)  # (dy, dx)
+    moving_prealigned = moving.copy()
+    
+    def correlation_metric(a: np.ndarray, b: np.ndarray) -> float:
+        a_flat = a.flatten().astype(np.float64)
+        b_flat = b.flatten().astype(np.float64)
+        if a_flat.std() == 0 or b_flat.std() == 0:
+            return 0.0
+        return float(np.corrcoef(a_flat, b_flat)[0, 1])
+    
+    if use_phase_init:
+        logger.info("  Stage 1: Phase correlation pre-alignment...")
+        try:
+            shift, error, diffphase = phase_cross_correlation(fixed, moving, upsample_factor=10)
+        except Exception as exc:
+            shift = np.array([0.0, 0.0])
+            logger.warning("    Phase correlation failed (%s). Skipping pre-alignment.", exc)
+        shift_mag = np.linalg.norm(shift)
+        logger.info(
+            "    Detected shift: dy=%.2f, dx=%.2f (|shift|=%.2f px)",
+            shift[0],
+            shift[1],
+            shift_mag
+        )
+        if shift_mag > prealign_threshold:
+            moving_prealigned = np.roll(moving, int(round(shift[0])), axis=0)
+            moving_prealigned = np.roll(moving_prealigned, int(round(shift[1])), axis=1)
+            pre_shift = shift.copy()
+            corr_before = correlation_metric(fixed, moving)
+            corr_after = correlation_metric(fixed, moving_prealigned)
+            logger.info(
+                "    Pre-alignment correlation: %.4f → %.4f",
+                corr_before,
+                corr_after
+            )
+        else:
+            logger.info("    Shift magnitude below threshold (%.1f). Skipping pre-roll.", prealign_threshold)
+    else:
+        logger.info("  Stage 1 skipped (phase init disabled).")
     
     # Normalize to 16-bit for better precision (microscopy data is often 16-bit)
     # OpenCV ECC supports float32, so we normalize to [0, 65535] then convert to float32
     fixed_norm = cv2.normalize(fixed.astype(np.float32), None, 0, 65535, cv2.NORM_MINMAX).astype(np.float32)
-    moving_norm = cv2.normalize(moving.astype(np.float32), None, 0, 65535, cv2.NORM_MINMAX).astype(np.float32)
+    moving_norm = cv2.normalize(moving_prealigned.astype(np.float32), None, 0, 65535, cv2.NORM_MINMAX).astype(np.float32)
     
     # Map transform type to OpenCV motion type
     motion_map = {
@@ -431,17 +452,6 @@ def register_images_ecc(
     
     # Initialize warp matrix (identity) and optional phase-correlation shift
     warp_matrix = np.eye(2, 3, dtype=np.float32)
-    phase_shift = None
-    
-    if use_phase_init:
-        try:
-            # Use phase correlation to estimate translation at full resolution
-            shift, error = register_images_phase_correlation(fixed, moving, upsample_factor=10)
-            phase_shift = (shift[0], shift[1])  # (dy, dx)
-            logger.info(f"  Phase correlation init (will apply at finest level): tx={shift[1]:.2f}, ty={shift[0]:.2f}, error={error:.4f}")
-        except Exception as e:
-            phase_shift = None
-            logger.warning(f"  Phase correlation init failed ({e}), proceeding without it")
     
     # Define adaptive termination criteria per pyramid level
     # Coarse levels: looser epsilon for faster exploration
@@ -463,6 +473,68 @@ def register_images_ecc(
         
         return (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iters, eps)
     
+    def analyze_warp_matrix(warp_matrix: np.ndarray, image_shape: Tuple[int, int]) -> Tuple[float, Tuple[float, float]]:
+        """Emit detailed diagnostics for a 2x3 warp matrix."""
+        m00, m01, m02 = warp_matrix[0]
+        m10, m11, m12 = warp_matrix[1]
+        angle_rad = np.arctan2(m10, m00)
+        angle_deg = np.degrees(angle_rad)
+        scale_x = np.sqrt(m00**2 + m10**2)
+        scale_y = np.sqrt(m01**2 + m11**2)
+        is_rigid = abs(scale_x - 1.0) < 0.01 and abs(scale_y - 1.0) < 0.01
+        h, w = image_shape
+        center = np.array([w / 2, h / 2, 1.0])
+        transformed_center = warp_matrix @ center
+        shift_center = transformed_center - center[:2]
+        logger.info("=" * 70)
+        logger.info("WARP MATRIX ANALYSIS")
+        logger.info("=" * 70)
+        logger.info(
+            "  [%8.5f  %8.5f  %8.2f]\n  [%8.5f  %8.5f  %8.2f]",
+            m00,
+            m01,
+            m02,
+            m10,
+            m11,
+            m12
+        )
+        logger.info("Rotation angle:     %7.3f° (% .5f rad)", angle_deg, angle_rad)
+        logger.info("Scale (X, Y):       (%.5f, %.5f)", scale_x, scale_y)
+        logger.info("Translation (x, y): (%.2f, %.2f) pixels", m02, m12)
+        logger.info("Is rigid body:      %s", is_rigid)
+        logger.info(
+            "Image center: (%.1f, %.1f) -> (%.2f, %.2f) shift=(%.2f, %.2f)",
+            w / 2,
+            h / 2,
+            transformed_center[0],
+            transformed_center[1],
+            shift_center[0],
+            shift_center[1]
+        )
+        corners = np.array([
+            [0.0, 0.0, 1.0],
+            [w, 0.0, 1.0],
+            [0.0, h, 1.0],
+            [w, h, 1.0]
+        ])
+        names = ['TL', 'TR', 'BL', 'BR']
+        for name, corner in zip(names, corners):
+            orig = corner[:2]
+            trans = warp_matrix @ corner
+            shift = trans - orig
+            logger.info(
+                "  %s: (%4.0f, %4.0f) -> (%7.2f, %7.2f) shift=(%6.2f, %6.2f)",
+                name,
+                orig[0],
+                orig[1],
+                trans[0],
+                trans[1],
+                shift[0],
+                shift[1]
+            )
+        logger.info("=" * 70)
+        return angle_deg, (m02, m12)
+    
     if not use_pyramid:
         # Single-scale ECC (original implementation)
         try:
@@ -478,10 +550,13 @@ def register_images_ecc(
                 gaussFiltSize=gauss_filt_size
             )
             logger.info(f"  ECC converged with correlation: {cc:.6f}")
-            logger.info(f"  Warp matrix:\n{warp_matrix}")
-            logger.info(f"  Translation: tx={warp_matrix[0,2]:.2f}, ty={warp_matrix[1,2]:.2f}")
-            logger.info(f"  Rotation: {np.degrees(np.arctan2(warp_matrix[1,0], warp_matrix[0,0])):.2f}°")
-            logger.info(f"  Scale: sx={np.sqrt(warp_matrix[0,0]**2 + warp_matrix[1,0]**2):.3f}")
+            angle_deg, translation = analyze_warp_matrix(warp_matrix, fixed.shape)
+            logger.info(
+                "  Single-scale diagnostics: angle=%.4f°, translation=(%.2f, %.2f)",
+                angle_deg,
+                translation[0],
+                translation[1]
+            )
             return warp_matrix, cc
         except cv2.error as e:
             raise RegistrationError(f"ECC optimization failed: {e}")
@@ -507,29 +582,6 @@ def register_images_ecc(
                 moving_scaled = moving_norm
             
             logger.debug(f"  Level {level+1}/{pyramid_levels}: scale=1/{scale}, size={fixed_scaled.shape}, eps={level_eps:.1e}")
-            
-            # Apply phase correlation initialization ONLY at the finest level
-            if level == len(scales) - 1 and phase_shift is not None:
-                # Convert phase shift (measured at full resolution) into the current scale
-                shift_dx = phase_shift[1] / scale
-                shift_dy = phase_shift[0] / scale
-                logger.debug(
-                    "    Applying phase init at level %d (scale=%s): "
-                    "raw=(%.3f, %.3f) -> scaled=(%.3f, %.3f)",
-                    level + 1,
-                    scale,
-                    phase_shift[1],
-                    phase_shift[0],
-                    shift_dx,
-                    shift_dy
-                )
-                warp_matrix[0, 2] += shift_dx
-                warp_matrix[1, 2] += shift_dy
-                logger.debug(
-                    "    Warp translation after phase init: tx=%.3f, ty=%.3f",
-                    warp_matrix[0, 2],
-                    warp_matrix[1, 2]
-                )
             
             # Run ECC at this scale with adaptive criteria
             (cc, warp_matrix) = cv2.findTransformECC(
@@ -562,10 +614,40 @@ def register_images_ecc(
                 # Rotation components (matrix[0:2, 0:2]) stay the same
         
         logger.info(f"  Multi-scale ECC converged with final correlation: {cc:.6f}")
+        angle_deg, translation = analyze_warp_matrix(warp_matrix, fixed.shape)
+        logger.info(
+            "  Final diagnostics: angle=%.4f°, translation=(%.2f, %.2f)",
+            angle_deg,
+            translation[0],
+            translation[1]
+        )
+        # Compose pre-shift with ECC warp (W_total = W_ecc ∘ T_pre)
+        if np.any(pre_shift != 0):
+            T_pre = np.array([
+                [1.0, 0.0, pre_shift[1]],
+                [0.0, 1.0, pre_shift[0]],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float32)
+            W_full = np.vstack([warp_matrix, [0.0, 0.0, 1.0]])
+            warp_matrix = (W_full @ T_pre)[:2, :]
+            logger.info(
+                "  Applied pre-shift composition -> final tx=%.2f, ty=%.2f",
+                warp_matrix[0, 2],
+                warp_matrix[1, 2]
+            )
         return warp_matrix, cc
         
     except cv2.error as e:
-        raise RegistrationError(f"Multi-scale ECC optimization failed: {e}")
+        logger.error("Multi-scale ECC optimization failed even after pre-alignment: %s", e)
+        warp_matrix = np.eye(2, 3, dtype=np.float32)
+        warp_matrix[0, 2] = pre_shift[1]
+        warp_matrix[1, 2] = pre_shift[0]
+        corr = correlation_metric(fixed, moving_prealigned)
+        logger.warning(
+            "Returning phase-correlation-only translation (corr=%.4f)",
+            corr
+        )
+        return warp_matrix, corr
 
 
 def warp_matrix_to_landmarks(
