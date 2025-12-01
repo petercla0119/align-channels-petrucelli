@@ -697,11 +697,13 @@ def register_dapi_channels(
             # Fall back to phase correlation with wrapping correction
             shift, error = register_images_phase_correlation(fixed_dapi, moving_dapi)
             
-            # Detect and fix wrapping artifacts
+            # Detect and fix wrapping artifacts AND suspicious shifts
             h, w = fixed_dapi.shape
             shift_threshold_percent = 0.2  # 20% of image size
-            shift_threshold_pixels = 200  # Absolute pixel threshold
+            shift_threshold_pixels = 200  # Absolute pixel threshold for wrapping
+            suspicious_shift_threshold = 50  # Shifts > 50 pixels are suspicious when ECC failed
             
+            # First check for wrapping
             if (abs(shift[0]) > h * shift_threshold_percent or abs(shift[1]) > w * shift_threshold_percent or 
                 abs(shift[0]) > shift_threshold_pixels or abs(shift[1]) > shift_threshold_pixels):
                 logger.warning(f"  Phase correlation detected large shift (y={shift[0]:.1f}, x={shift[1]:.1f}), checking for wrapping...")
@@ -714,6 +716,30 @@ def register_dapi_channels(
                 if abs(alt_shift_x) < abs(shift[1]):
                     shift[1] = alt_shift_x
                     logger.warning(f"  Corrected X shift to: {shift[1]:.1f} (unwrapped from periodic boundary)")
+            
+            # Check if shift is still suspicious (likely noise/artifact on near-identical images)
+            shift_magnitude = np.sqrt(shift[0]**2 + shift[1]**2)
+            if shift_magnitude > suspicious_shift_threshold:
+                # Check if maybe the images DO need a small shift that phase correlation found
+                # Calculate image correlation to assess similarity
+                from scipy.stats import pearsonr
+                fixed_flat = fixed_dapi.flatten()
+                moving_flat = moving_dapi.flatten()
+                correlation, _ = pearsonr(fixed_flat, moving_flat)
+                
+                logger.warning(f"  Phase correlation shift magnitude {shift_magnitude:.1f} pixels seems unreliable")
+                logger.warning(f"  Image correlation: {correlation:.4f}")
+                
+                if correlation > 0.95:
+                    # Images are very similar - likely already aligned or need sub-pixel shift
+                    logger.warning(f"  High correlation ({correlation:.4f}) suggests images are nearly identical")
+                    logger.warning(f"  Applying identity transform (no shift) - images may already be aligned")
+                    shift = np.array([0.0, 0.0])
+                else:
+                    # Images are different but alignment failed - keep the phase correlation result as best guess
+                    logger.warning(f"  Moderate correlation ({correlation:.4f}) suggests images differ significantly")
+                    logger.warning(f"  Keeping phase correlation shift as best available estimate")
+                    logger.warning(f"  Manual inspection STRONGLY recommended for this pair")
             
             center = np.array([[w / 2, h / 2]])
             src_landmarks = center.copy()
