@@ -311,7 +311,12 @@ def apply_rigid_transform(
     
     # Extract parameters - always compute all values
     if 'matrix_2x3' in transform_params:
-        matrix = transform_params['matrix_2x3']
+        matrix = np.array(transform_params['matrix_2x3'], dtype=float)
+        m00, m01, tx = matrix[0]
+        m10, m11, ty = matrix[1]
+        angle_deg = np.degrees(np.arctan2(m10, m00))
+    elif 'warp_matrix_2x3' in transform_params:
+        matrix = np.array(transform_params['warp_matrix_2x3'], dtype=float)
         m00, m01, tx = matrix[0]
         m10, m11, ty = matrix[1]
         angle_deg = np.degrees(np.arctan2(m10, m00))

@@ -187,63 +187,68 @@ def align_two_channel_images(
             
             logger.info(f"  Registration successful: {reg_result['num_matches']} landmarks")
         
-        # 6. Compute transformation matrix
+        def affine_dict_from_matrix(matrix_2x3: np.ndarray, transform_type: str) -> Dict:
+            """Build transform_params dict from a 2x3 affine matrix."""
+            m00, m01, m02 = matrix_2x3[0, :]
+            m10, m11, m12 = matrix_2x3[1, :]
+            angle_deg = float(np.degrees(np.arctan2(m10, m00)))
+            matrix_3x3 = np.vstack([matrix_2x3, [0.0, 0.0, 1.0]])
+            return {
+                'm00': float(m00),
+                'm01': float(m01),
+                'm02': float(m02),
+                'm10': float(m10),
+                'm11': float(m11),
+                'm12': float(m12),
+                'angle': angle_deg,
+                'matrix_2x3': matrix_2x3,
+                'matrix_3x3': matrix_3x3,
+                'transform_type': transform_type
+            }
+        
+        def invert_affine_matrix(matrix_2x3: np.ndarray) -> np.ndarray:
+            matrix_3x3 = np.vstack([matrix_2x3, [0.0, 0.0, 1.0]])
+            matrix_inv = np.linalg.inv(matrix_3x3)
+            return matrix_inv[:2, :]
+        
+        transform_type_final = reg_result['transform_type']
+        warp_matrix_direct = None
+        if 'warp_matrix_2x3' in reg_result:
+            warp_matrix_direct = np.array(reg_result['warp_matrix_2x3'], dtype=float)
+        
+        # 6. Compute transformation
         logger.info("Step 5/7: Computing transformation matrix...")
         
-        # Invert transformation if requested (swap source and destination)
         if invert_transform:
-            logger.warning("  Inverting transformation (swapping source and destination landmarks)")
-            src_landmarks = reg_result['dst_landmarks']
-            dst_landmarks = reg_result['src_landmarks']
+            logger.warning("  Inverting transformation (swapping source and destination landmarks / matrix)")
+            if warp_matrix_direct is not None:
+                warp_matrix_direct = invert_affine_matrix(warp_matrix_direct)
+            else:
+                src_landmarks = reg_result['dst_landmarks']
+                dst_landmarks = reg_result['src_landmarks']
         else:
             src_landmarks = reg_result['src_landmarks']
             dst_landmarks = reg_result['dst_landmarks']
         
-        transform_matrix = get_transformation_matrix(
-            src_landmarks,
-            dst_landmarks,
-            reg_result['transform_type']
-        )
-        
-        transform_params = rigid_from_landmarks(
-            src_landmarks,
-            dst_landmarks
-        )
-        
-        def compute_landmark_residuals(src_pts: np.ndarray, dst_pts: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-            """Return per-landmark Euclidean error between desired and predicted dst points."""
-            if src_pts.size == 0:
-                return np.array([])
-            src_h = np.column_stack([src_pts, np.ones(len(src_pts))])
-            predicted = (matrix[:2, :] @ src_h.T).T
-            residuals = np.linalg.norm(predicted - dst_pts, axis=1)
-            return residuals
-        
-        landmark_residuals = compute_landmark_residuals(
-            src_landmarks,
-            dst_landmarks,
-            transform_matrix
-        )
-        if landmark_residuals.size:
-            max_resid = float(np.max(landmark_residuals))
-            mean_resid = float(np.mean(landmark_residuals))
-            logger.info(
-                "  Landmark residuals (pixels): mean=%.4f max=%.4f",
-                mean_resid,
-                max_resid
-            )
-            if max_resid > 5.0:
-                logger.warning(
-                    "  Landmark residuals exceed 5px (max=%.3f). "
-                    "Check registration quality for this pair.",
-                    max_resid
-                )
+        if warp_matrix_direct is not None:
+            transform_matrix = np.vstack([warp_matrix_direct, [0.0, 0.0, 1.0]])
+            transform_params = affine_dict_from_matrix(warp_matrix_direct, transform_type_final)
+            logger.info("  Using ECC warp matrix directly (no landmark reconversion)")
+            logger.info(f"  Matrix:\n{transform_matrix}")
+            logger.info(f"  Rotation angle: {transform_params['angle']:.3f} degrees")
         else:
-            logger.info("  Landmark residuals unavailable (no landmarks reported).")
-        
-        logger.info(f"  Transform type: {transform_params['transform_type']}")
-        logger.info(f"  Rotation angle: {transform_params['angle']:.3f} degrees")
-        logger.info(f"  Matrix:\n{transform_matrix}")
+            transform_matrix = get_transformation_matrix(
+                src_landmarks,
+                dst_landmarks,
+                transform_type_final
+            )
+            transform_params = rigid_from_landmarks(
+                src_landmarks,
+                dst_landmarks
+            )
+            logger.info(f"  Transform type: {transform_params['transform_type']}")
+            logger.info(f"  Rotation angle: {transform_params['angle']:.3f} degrees")
+            logger.info(f"  Matrix:\n{transform_matrix}")
         
         # 7. Apply transformation to BOTH channels of moving image
         logger.info("Step 6/7: Applying transformation to moving image...")
@@ -303,7 +308,7 @@ def align_two_channel_images(
             'matrix_2x3': transform_params['matrix_2x3'].tolist(),
             'matrix_3x3': transform_params['matrix_3x3'].tolist(),
             'angle_degrees': float(transform_params['angle']),
-            'landmark_residuals': landmark_residuals.tolist() if landmark_residuals.size else [],
+            'warp_matrix_2x3': warp_matrix_direct.tolist() if warp_matrix_direct is not None else [],
             'parameters': {
                 'm00': float(transform_params['m00']),
                 'm01': float(transform_params['m01']),
@@ -355,7 +360,6 @@ def align_two_channel_images(
             'registration_method': reg_result['method'],
             'num_landmarks': reg_result['num_matches'],
             'rotation_angle_degrees': transform_params['angle'],
-            'landmark_residuals': landmark_residuals.tolist() if landmark_residuals.size else [],
             'output_directory': str(paths['root']),
             'files_created': {
                 'aligned': [f"{prefix}_fixed.tif", f"{prefix}_moving_aligned.tif"],

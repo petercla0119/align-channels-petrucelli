@@ -820,7 +820,7 @@ def register_dapi_channels(
             'transform_type': transform_type,
             'method': 'ecc',
             'num_matches': len(src_landmarks),
-            'warp_matrix': warp_matrix,
+            'warp_matrix_2x3': warp_matrix,
             'correlation': correlation
         }
         
