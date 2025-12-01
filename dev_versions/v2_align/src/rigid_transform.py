@@ -354,12 +354,12 @@ def apply_rigid_transform(
         
         # Apply transform with INVERSE mapping
         # This is the key: WARP_INVERSE_MAP tells OpenCV to use the inverse transform
-        # which is what FIJI does internally
+        # Remove WARP_INVERSE_MAP - it's inverting an already-correct transform
         transformed = cv2.warpAffine(
             image_f32,
             matrix,
             (w, h),
-            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+            flags=cv2.INTER_LINEAR,  # ← Just use LINEAR interpolation
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=float(cval)
         )
