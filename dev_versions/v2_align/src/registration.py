@@ -478,6 +478,10 @@ def register_images_ecc(
                 gaussFiltSize=gauss_filt_size
             )
             logger.info(f"  ECC converged with correlation: {cc:.6f}")
+            logger.info(f"  Warp matrix:\n{warp_matrix}")
+            logger.info(f"  Translation: tx={warp_matrix[0,2]:.2f}, ty={warp_matrix[1,2]:.2f}")
+            logger.info(f"  Rotation: {np.degrees(np.arctan2(warp_matrix[1,0], warp_matrix[0,0])):.2f}°")
+            logger.info(f"  Scale: sx={np.sqrt(warp_matrix[0,0]**2 + warp_matrix[1,0]**2):.3f}")
             return warp_matrix, cc
         except cv2.error as e:
             raise RegistrationError(f"ECC optimization failed: {e}")
@@ -506,9 +510,26 @@ def register_images_ecc(
             
             # Apply phase correlation initialization ONLY at the finest level
             if level == len(scales) - 1 and phase_shift is not None:
-                warp_matrix[0, 2] += phase_shift[1]  # dx
-                warp_matrix[1, 2] += phase_shift[0]  # dy
-                logger.debug(f"    Applied phase init at finest level: tx+={phase_shift[1]:.2f}, ty+={phase_shift[0]:.2f}")
+                # Convert phase shift (measured at full resolution) into the current scale
+                shift_dx = phase_shift[1] / scale
+                shift_dy = phase_shift[0] / scale
+                logger.debug(
+                    "    Applying phase init at level %d (scale=%s): "
+                    "raw=(%.3f, %.3f) -> scaled=(%.3f, %.3f)",
+                    level + 1,
+                    scale,
+                    phase_shift[1],
+                    phase_shift[0],
+                    shift_dx,
+                    shift_dy
+                )
+                warp_matrix[0, 2] += shift_dx
+                warp_matrix[1, 2] += shift_dy
+                logger.debug(
+                    "    Warp translation after phase init: tx=%.3f, ty=%.3f",
+                    warp_matrix[0, 2],
+                    warp_matrix[1, 2]
+                )
             
             # Run ECC at this scale with adaptive criteria
             (cc, warp_matrix) = cv2.findTransformECC(
@@ -521,13 +542,23 @@ def register_images_ecc(
                 gaussFiltSize=gauss_filt_size
             )
             
-            logger.debug(f"    Correlation: {cc:.6f}")
+            logger.debug(
+                "    Correlation: %.6f | warp tx=%.3f ty=%.3f",
+                cc,
+                warp_matrix[0, 2],
+                warp_matrix[1, 2]
+            )
             
             # Scale up transformation for next level
             if scale > 1 and level < len(scales) - 1:
                 # Translation components need to be scaled up
                 warp_matrix[0, 2] *= 2.0  # x translation
                 warp_matrix[1, 2] *= 2.0  # y translation
+                logger.debug(
+                    "    Upscaled warp translation for next level: tx=%.3f ty=%.3f",
+                    warp_matrix[0, 2],
+                    warp_matrix[1, 2]
+                )
                 # Rotation components (matrix[0:2, 0:2]) stay the same
         
         logger.info(f"  Multi-scale ECC converged with final correlation: {cc:.6f}")
@@ -557,6 +588,13 @@ def warp_matrix_to_landmarks(
         Tuple of (src_landmarks, dst_landmarks) as Nx2 arrays
     """
     h, w = image_shape
+    logger.debug(
+        "  Converting warp matrix to landmarks (image size: %dx%d). "
+        "Matrix:\n%s",
+        h,
+        w,
+        warp_matrix
+    )
     
     # Define anchor points based on transform type (matching FIJI MultiStackReg)
     if transform_type == 'RIGID_BODY':
@@ -588,6 +626,12 @@ def warp_matrix_to_landmarks(
     # warp_matrix is 2x3, need to add homogeneous coordinate
     src_pts_h = np.column_stack([src_pts, np.ones(len(src_pts))])  # Nx3
     dst_pts = (warp_matrix @ src_pts_h.T).T  # (2x3) @ (3xN)^T -> (2xN)^T -> Nx2
+    
+    # Sanity check: make sure coordinates are finite and within bounds
+    if not np.all(np.isfinite(dst_pts)):
+        raise RegistrationError("Warp matrix produced non-finite landmark coordinates")
+    
+    logger.debug("  Landmark pairs (src -> dst): %s -> %s", src_pts, dst_pts)
     
     logger.debug(f"  Generated {len(src_pts)} landmark pairs from warp matrix")
     

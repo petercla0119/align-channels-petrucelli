@@ -210,6 +210,37 @@ def align_two_channel_images(
             dst_landmarks
         )
         
+        def compute_landmark_residuals(src_pts: np.ndarray, dst_pts: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+            """Return per-landmark Euclidean error between desired and predicted dst points."""
+            if src_pts.size == 0:
+                return np.array([])
+            src_h = np.column_stack([src_pts, np.ones(len(src_pts))])
+            predicted = (matrix[:2, :] @ src_h.T).T
+            residuals = np.linalg.norm(predicted - dst_pts, axis=1)
+            return residuals
+        
+        landmark_residuals = compute_landmark_residuals(
+            src_landmarks,
+            dst_landmarks,
+            transform_matrix
+        )
+        if landmark_residuals.size:
+            max_resid = float(np.max(landmark_residuals))
+            mean_resid = float(np.mean(landmark_residuals))
+            logger.info(
+                "  Landmark residuals (pixels): mean=%.4f max=%.4f",
+                mean_resid,
+                max_resid
+            )
+            if max_resid > 5.0:
+                logger.warning(
+                    "  Landmark residuals exceed 5px (max=%.3f). "
+                    "Check registration quality for this pair.",
+                    max_resid
+                )
+        else:
+            logger.info("  Landmark residuals unavailable (no landmarks reported).")
+        
         logger.info(f"  Transform type: {transform_params['transform_type']}")
         logger.info(f"  Rotation angle: {transform_params['angle']:.3f} degrees")
         logger.info(f"  Matrix:\n{transform_matrix}")
@@ -272,6 +303,7 @@ def align_two_channel_images(
             'matrix_2x3': transform_params['matrix_2x3'].tolist(),
             'matrix_3x3': transform_params['matrix_3x3'].tolist(),
             'angle_degrees': float(transform_params['angle']),
+            'landmark_residuals': landmark_residuals.tolist() if landmark_residuals.size else [],
             'parameters': {
                 'm00': float(transform_params['m00']),
                 'm01': float(transform_params['m01']),
@@ -323,6 +355,7 @@ def align_two_channel_images(
             'registration_method': reg_result['method'],
             'num_landmarks': reg_result['num_matches'],
             'rotation_angle_degrees': transform_params['angle'],
+            'landmark_residuals': landmark_residuals.tolist() if landmark_residuals.size else [],
             'output_directory': str(paths['root']),
             'files_created': {
                 'aligned': [f"{prefix}_fixed.tif", f"{prefix}_moving_aligned.tif"],
