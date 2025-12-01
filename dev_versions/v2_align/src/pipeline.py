@@ -233,6 +233,7 @@ def align_two_channel_images(
         if warp_matrix_direct is not None:
             transform_matrix = np.vstack([warp_matrix_direct, [0.0, 0.0, 1.0]])
             transform_params = affine_dict_from_matrix(warp_matrix_direct, transform_type_final)
+            transform_params['warp_matrix_2x3'] = warp_matrix_direct
             logger.info("  Using ECC warp matrix directly (no landmark reconversion)")
             logger.info(f"  Matrix:\n{transform_matrix}")
             logger.info(f"  Rotation angle: {transform_params['angle']:.3f} degrees")

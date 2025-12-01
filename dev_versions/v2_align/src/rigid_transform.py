@@ -310,13 +310,15 @@ def apply_rigid_transform(
         raise TransformError(f"Image must be 2D, got shape: {image.shape}")
     
     # Extract parameters - always compute all values
-    if 'matrix_2x3' in transform_params:
-        matrix = np.array(transform_params['matrix_2x3'], dtype=float)
+    use_inverse_flag = False
+    if 'warp_matrix_2x3' in transform_params:
+        matrix = np.array(transform_params['warp_matrix_2x3'], dtype=float)
+        use_inverse_flag = True
         m00, m01, tx = matrix[0]
         m10, m11, ty = matrix[1]
         angle_deg = np.degrees(np.arctan2(m10, m00))
-    elif 'warp_matrix_2x3' in transform_params:
-        matrix = np.array(transform_params['warp_matrix_2x3'], dtype=float)
+    elif 'matrix_2x3' in transform_params:
+        matrix = np.array(transform_params['matrix_2x3'], dtype=float)
         m00, m01, tx = matrix[0]
         m10, m11, ty = matrix[1]
         angle_deg = np.degrees(np.arctan2(m10, m00))
@@ -357,14 +359,15 @@ def apply_rigid_transform(
         # Convert image to float32 for OpenCV
         image_f32 = image.astype(np.float32)
         
-        # Apply transform with INVERSE mapping
-        # This is the key: WARP_INVERSE_MAP tells OpenCV to use the inverse transform
-        # Remove WARP_INVERSE_MAP - it's inverting an already-correct transform
+        # Apply transform; ECC matrices need inverse flag
+        flags = cv2.INTER_LINEAR
+        if use_inverse_flag:
+            flags |= cv2.WARP_INVERSE_MAP
         transformed = cv2.warpAffine(
             image_f32,
             matrix,
             (w, h),
-            flags=cv2.INTER_LINEAR,  # ← Just use LINEAR interpolation
+            flags=flags,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=float(cval)
         )
