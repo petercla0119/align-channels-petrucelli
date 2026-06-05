@@ -282,7 +282,7 @@ def align_pair_using_nuclei(
     imwrite(output_dir / f"{sample_name}_aligned_ch1.tif", aligned_ch1)
     
     if verbose:
-        print(f"\n✅ Saved aligned images:")
+        print(f"\n Saved aligned images:")
         print(f"   {stack_path.name}")
     
     # Generate QC images
@@ -324,7 +324,7 @@ def align_pair_using_nuclei(
     if verbose:
         print(f"   {log_path.name}")
         print("\n" + "=" * 70)
-        print("✅ Complete!")
+        print(" Complete!")
         print("=" * 70)
     
     return {
