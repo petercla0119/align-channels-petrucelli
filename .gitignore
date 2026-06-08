@@ -9,3 +9,9 @@
 *.java
 *.html
 */__pycache__/*
+TurboReg_API/
+MultiStackRegistration-master/
+venv/
+output/
+tasks/
+tests/

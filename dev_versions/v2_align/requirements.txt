@@ -1,0 +1,7 @@
+# Python runtime: >=3.9 (3.9, 3.10, 3.11, 3.12 validated)
+numpy>=1.26.0,<2.0
+scipy>=1.12.0,<1.13
+Pillow>=10.2.0,<11.0
+tifffile>=2023.9.26
+scikit-image>=0.22.0,<0.23
+opencv-python>=4.8.1.78,<4.10.0.0
